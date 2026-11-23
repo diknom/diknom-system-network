@@ -1,0 +1,3036 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""DikNom System Network — panel jaringan + kontrol Wi-Fi lintas distro.
+
+Halaman:
+  Dashboard  ringkasan koneksi internet, WiFi, LAN/USB, trafik, DNS
+  WiFi       status kartu, watchdog, pemulihan, hemat daya, log kernel
+  Jaringan   semua interface, rute, DNS, port lokal
+  Tentang    info aplikasi + mesin
+
+Tidak memasang driver luar dan tidak mengubah parameter kernel.
+Aksi yang butuh root memakai pkexec (dialog izin di desktop).
+"""
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import threading
+import queue
+import time
+import traceback
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk
+
+APP = "DikNom System Network"
+VER = "1.1"
+HOME = os.path.expanduser("~")
+WIFI_RESET = os.path.join(HOME, ".local", "bin", "wifi-reset")
+
+BG = "#0a0f15"
+SIDEBAR = "#080d13"
+CARD = "#111923"
+CARD_ALT = "#0e151e"
+INPUT = "#0b1219"
+BORDER = "#22303d"
+ACCENT = "#3b82f6"
+FG = "#e8eef5"
+MUT = "#93a1b3"
+DIM = "#526173"
+GREEN = "#34d399"
+RED = "#f87171"
+ORANGE = "#fbbf24"
+BLUE = "#60a5fa"
+PURPLE = "#c084fc"
+TEAL = "#2dd4bf"
+
+ZCONF = "/etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf"
+TMPCONF = "/tmp/diknom-network-powersave.conf"
+HOTSPOT_HELPER = "/usr/local/lib/diknom-network/diknom-hotspot-helper"
+CFG_DIR = os.path.join(HOME, ".config", "diknom-network")
+CFG_PATH = os.path.join(CFG_DIR, "config.json")
+HOTSPOT_DEFAULTS = {
+    "ssid": "DikNom Hotspot",
+    "password": "",
+    "security": "wpa2",
+    "max_clients": 8,
+    "upstream": "auto",
+    "blacklist": [],
+    "language": "auto",
+}
+
+LANG = "id"
+
+EN = {
+    # Navigasi & umum
+    "Dashboard": "Dashboard",
+    "WiFi": "Wi-Fi",
+    "wifi": "Wi-Fi",
+    "Jaringan": "Network",
+    "Hotspot": "Hotspot",
+    "Pengaturan": "Settings",
+    "Setting": "Settings",
+    "Tentang": "About",
+    "MENU": "MENU",
+    "Terhubung": "Connected",
+    "Waktu": "Time",
+    "memuat…": "loading…",
+    "siap": "ready",
+    "aktif:": "active:",
+    "aktif": "active",
+    "nonaktif": "inactive",
+    "ONLINE": "ONLINE",
+    "TANPA INTERNET": "NO INTERNET",
+    "tidak ada": "not available",
+    "tidak terdeteksi (wedge)": "not detected (wedge)",
+    "tanpa rute default": "no default route",
+    "Belum ada trafik": "No traffic yet",
+    "ethernet / USB": "ethernet / USB",
+    "connected": "connected",
+    "disconnected": "disconnected",
+    "unavailable": "unavailable",
+    "unmanaged": "unmanaged",
+    "enabled": "enabled",
+    "disabled": "disabled",
+    "active": "active",
+    "inactive": "inactive",
+    "nonaktif.": "inactive.",
+    "terhubung": "connected",
+
+    # Dashboard
+    "Ringkasan koneksi, antarmuka, dan lalu lintas":
+        "Connection, interfaces, and traffic overview",
+    "Koneksi internet": "Internet connection",
+    "Sumber aktif": "Active source",
+    "Interface": "Interface",
+    "Jenis": "Type",
+    "IP lokal": "Local IP",
+    "Gateway": "Gateway",
+    "DNS": "DNS",
+    "kartu nirkabel": "wireless card",
+    "Sinyal": "Signal",
+    "Band": "Band",
+    "Kecepatan": "Speed",
+    "Hemat daya": "Power saving",
+    "LAN / USB": "LAN / USB",
+    "kabel & tethering": "cable & tethering",
+    "Kecepatan link": "Link speed",
+    "Status": "Status",
+    "Semua koneksi": "All connections",
+    "Perangkat": "Device",
+    "Profil": "Profile",
+    "Trafik": "Traffic",
+    "per detik": "per second",
+    "Rute default": "Default route",
+    "gateway aktif": "active gateway",
+    "Port lokal (listen)": "Local ports (listen)",
+    "Port lokal": "Local ports",
+    "via": "via",
+
+    # WiFi
+    "Status koneksi": "Connection status",
+    "Status kartu": "Card status",
+    "Radio": "Radio",
+    "Frekuensi": "Frequency",
+    "Jalur internet": "Internet path",
+    "Error 5 menit": "Errors (5 min)",
+    "Timer": "Timer",
+    "Terakhir jalan": "Last run",
+    "Berikutnya": "Next",
+    "Aktifkan": "Enable",
+    "Matikan": "Disable",
+    "Jalankan sekarang": "Run now",
+    "Pemulihan": "Recovery",
+    "tanpa driver luar": "no external driver",
+    "Reset WiFi": "Reset Wi-Fi",
+    "Cek cepat": "Quick check",
+    "Scan ulang": "Rescan",
+    "Matikan / nyalakan radio WiFi": "Turn Wi-Fi radio off / on",
+    "Reset memakai jalur aman: lepas driver in-kernel + reset PCI.":
+        "Reset uses a safe path: unload the in-kernel driver + PCI reset.",
+    "Jaringan WiFi": "Wi-Fi networks",
+    "scan & konek": "scan & connect",
+    "Hubungkan": "Connect",
+    "Buka halaman login": "Open login page",
+    "Portal:": "Portal:",
+    "belum scan": "not scanned yet",
+    "Buka": "Open",
+    "Info perangkat": "Device info",
+    "Log kernel (Wi-Fi)": "Kernel log (Wi-Fi)",
+    "40 baris terakhir": "last 40 lines",
+    "mnt": "min",
+    "dtk": "sec",
+    "enabled": "enabled",
+    "active": "active",
+    "inactive": "inactive",
+    "tidak terdeteksi": "not detected",
+
+    # Network
+    "detail per perangkat": "details per device",
+    "DNS & MAC": "DNS & MAC",
+    "perangkat aktif": "active devices",
+    "IP / subnet": "IP / subnet",
+    "Sistem": "System",
+
+    # Hotspot
+    "Status Hotspot": "Hotspot status",
+    "AP + STA": "AP + STA",
+    "Nonaktif": "Inactive",
+    "Aktif": "Active",
+    "Mulai Hotspot": "Start Hotspot",
+    "Hentikan Hotspot": "Stop Hotspot",
+    "Keamanan": "Security",
+    "Sumber": "Source",
+    "Client": "Clients",
+    "Konfigurasi Hotspot": "Hotspot configuration",
+    "SSID & keamanan": "SSID & security",
+    "Password": "Password",
+    "Tampilkan": "Show",
+    "WPA2": "WPA2",
+    "WPA3": "WPA3",
+    "WPA2/WPA3": "WPA2/WPA3",
+    "Terbuka": "Open",
+    "Maks. client": "Max clients",
+    "Sumber LAN/USB": "LAN/USB source",
+    "Otomatis (LAN/USB)": "Automatic (LAN/USB)",
+    "Sementara sumber hanya LAN/USB. AP tetap memakai Wi-Fi (ap0) untuk "
+    "client; uplink Wi-Fi dinonaktifkan agar koneksi host stabil.":
+        "For now, only LAN/USB can be the source. The AP still uses Wi-Fi "
+        "(ap0) for clients; Wi-Fi uplink is disabled so the host stays stable.",
+    "Daftar Blacklist": "Blacklist",
+    "perangkat yang ditolak": "rejected devices",
+    "Belum ada MAC.": "No MAC addresses yet.",
+    "Tambah": "Add",
+    "Hapus Blacklist": "Remove from blacklist",
+    "Client Terhubung": "Connected clients",
+    "Segarkan": "Refresh",
+    "Blacklist": "Blacklist",
+    "Putuskan": "Disconnect",
+    "Hostname": "Hostname",
+    "Terhubung": "Connected",
+    "Belum ada client.": "No clients yet.",
+    "%d client / %s": "%d client / %s",
+    "0 client": "0 clients",
+    "Hotspot berjalan. Client terhubung ke jaringan ini.":
+        "Hotspot is running. Clients are connected to this network.",
+    "Uplink LAN/USB. AP Wi-Fi tetap tersedia untuk client; uplink Wi-Fi "
+    "dinonaktifkan sementara.":
+        "LAN/USB uplink. The Wi-Fi AP remains available for clients; Wi-Fi "
+        "uplink is temporarily disabled.",
+    "Helper hotspot belum dipasang. Jalankan sudo ./install-hotspot.sh "
+    "dari folder tool.":
+        "The hotspot helper is not installed. Run sudo ./install-hotspot.sh "
+        "from the tool folder.",
+    "SSID tidak boleh kosong.": "SSID cannot be empty.",
+    "Password minimal 8 karakter.": "Password must be at least 8 characters.",
+
+    # Settings
+    "Language": "Language",
+    "Bahasa": "Language",
+    "Otomatis (sistem)": "Automatic (system)",
+    "Indonesia": "Indonesia",
+    "English": "English",
+    "Otomatis mengikuti locale sistem. Perubahan langsung diterapkan ke "
+    "seluruh halaman.":
+        "Automatic follows the system locale. Changes apply to every page "
+        "immediately.",
+    "Hemat daya (powersave)": "Power saving (powersave)",
+    "Global": "Global",
+    "Nonaktifkan": "Disable",
+    "Aktifkan (bawaan)": "Enable (default)",
+    "Nonaktif = paling stabil untuk kartu ini. Berlaku global dan untuk "
+    "setiap profil WiFi.":
+        "Disabled is the most stable setting for this card. Applies globally "
+        "and to every Wi-Fi profile.",
+    "Parameter driver": "Driver parameters",
+    "baca saja": "read only",
+    "Sumber modul": "Module source",
+    "Apa efek tiap pilihan": "What each option does",
+    "penjelasan": "explanation",
+    "Powersave nonaktif": "Powersave disabled",
+    "Kartu tidak masuk mode hemat daya. Ini setelan yang dipakai sekarang "
+    "dan yang membuat kartu jauh lebih jarang wedge.":
+        "The card does not enter power-save mode. This is the current setting "
+        "and makes the card wedge much less often.",
+    "Powersave aktif (bawaan)": "Powersave enabled (default)",
+    "Mengembalikan perilaku bawaan NetworkManager. Hemat baterai sedikit, "
+    "tapi pada beberapa kartu Wi-Fi sering memicu macet dan daftar WiFi kosong.":
+        "Restores NetworkManager's default behavior. Saves a little battery, "
+        "but on some Wi-Fi cards it often causes hangs and an empty Wi-Fi list.",
+    "disable_lps_deep dan disable_aspm dibaca dari modul kernel saat dimuat. "
+    "Untuk mengubahnya perlu edit /etc/modprobe.d/rtw88-powersave.conf lalu "
+    "muat ulang driver — di luar cakupan panel ini supaya aman.":
+        "disable_lps_deep and disable_aspm are read from the kernel module at "
+        "load time. Changing them requires editing "
+        "/etc/modprobe.d/rtw88-powersave.conf and reloading the driver — out "
+        "of this panel's scope for safety.",
+    "Pengaturan disimpan otomatis di ~/.config/diknom-network/config.json":
+        "Settings are saved automatically to ~/.config/diknom-network/config.json",
+
+    # Tentang
+    "Tentang aplikasi": "About application",
+    "Tentang DikNom System Network": "About DikNom System Network",
+    "informasi sistem": "system information",
+    "perawatan": "maintenance",
+    "DikNom System Network adalah panel jaringan untuk laptop ini. Semua "
+    "yang berhubungan dengan koneksi dan WiFi dikumpulkan di satu tempat: "
+    "status koneksi internet, kartu Wi-Fi, LAN/USB, hotspot Wi-Fi, "
+    "trafik, rute, DNS, watchdog pemulihan, dan setelan hemat daya.":
+        "DikNom System Network is the network panel for this laptop. "
+        "Everything related to connectivity and Wi-Fi is collected in one "
+        "place: internet status, Wi-Fi card, LAN/USB, Wi-Fi hotspot, "
+        "traffic, routes, DNS, recovery watchdog, and power-saving settings.",
+    "Tidak memasang driver luar (DKMS) dan tidak mengubah parameter kernel.":
+        "Does not install out-of-tree drivers (DKMS) and does not change "
+        "kernel parameters.",
+    "Tombol pemulihan memanggil skrip yang sudah ada: "
+    "~/.local/bin/wifi-reset.":
+        "The recovery button calls the existing script: "
+        "~/.local/bin/wifi-reset.",
+    "Watchdog memakai unit systemd wifi-watchdog.timer (root).":
+        "The watchdog uses the systemd unit wifi-watchdog.timer (root).",
+    "Hemat daya ditulis ke /etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf.":
+        "Power saving is written to "
+        "/etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf.",
+    "Hotspot memakai hostapd + dnsmasq; AP virtual di Wi-Fi tetap tersedia, "
+    "tetapi untuk sementara uplink hanya LAN/USB agar koneksi host tidak "
+    "terganggu.":
+        "The hotspot uses hostapd + dnsmasq; the virtual Wi-Fi AP remains "
+        "available, but for now only LAN/USB can be the uplink so the host "
+        "connection is not disturbed.",
+    "Aksi yang butuh root memakai pkexec, dengan dialog izin di desktop.":
+        "Actions that need root use pkexec, with a permission dialog on the "
+        "desktop.",
+    "Kartu Wi-Fi dan driver in-kernel di mesin ini sesekali "
+    "wedge. Kalau daftar WiFi kosong atau CPU naik karena banjir log pci bus "
+    "timeout, buka halaman WiFi lalu tekan Reset WiFi. Kalau di sekolah "
+    "lebih nyaman memakai hotspot USB, matikan radio WiFi dari halaman yang "
+    "sama — internet tidak terputus selama rute default memakai hotspot.":
+        "The Wi-Fi card and in-kernel driver on this machine "
+        "occasionally wedges. If the Wi-Fi list is empty or CPU rises due to "
+        "a flood of pci bus timeout logs, open the Wi-Fi page and press Reset "
+        "Wi-Fi. If USB tethering is more convenient at school, turn the Wi-Fi "
+        "radio off from the same page — internet stays up as long as the "
+        "default route uses the hotspot.",
+    "Hostname": "Hostname",
+    "Kernel": "Kernel",
+    "Desktop": "Desktop",
+    "Uptime": "Uptime",
+    "Catatan": "Notes",
+    "Mesin ini": "This machine",
+    "Panel jaringan ringan untuk Linux": "Lightweight network panel for Linux",
+    "Semua yang berhubungan dengan koneksi dan Wi-Fi dalam satu panel: "
+    "status internet, kartu Wi-Fi, LAN/USB, hotspot, trafik, rute, DNS, "
+    "pemulihan, dan pengaturan driver.":
+        "Everything related to connectivity and Wi-Fi in one panel: internet "
+        "status, Wi-Fi card, LAN/USB, hotspot, traffic, routes, DNS, recovery, "
+        "and driver settings.",
+    "Wi-Fi": "Wi-Fi",
+    "DEVELOPER": "DEVELOPER",
+    "Dikembangkan oleh": "Developed by",
+    "Dashboard, interface, rute, DNS, dan port.":
+        "Dashboard, interfaces, routes, DNS, and ports.",
+    "Status kartu, scan, pemulihan, dan driver.":
+        "Card status, scan, recovery, and driver.",
+    "AP Wi-Fi, client, batas client, dan blacklist.":
+        "Wi-Fi AP, clients, client limit, and blacklist.",
+    "Lintas distro": "Cross-distro",
+    "Installer dan deteksi hardware yang tidak terikat satu distro.":
+        "Installer and hardware detection without distro lock-in.",
+    "Distro": "Distro",
+    "Paket": "Package",
+    "Driver WiFi": "Wi-Fi driver",
+    "Chip WiFi": "Wi-Fi chip",
+    "Dukungan AP": "AP support",
+    "deteksi otomatis": "automatic detection",
+    "Chip": "Chip",
+    "Aksi yang membutuhkan root memakai pkexec, dengan dialog izin di desktop. "
+    "Instalasi hotspot bersifat opsional; tanpa helper, halaman Hotspot tetap "
+    "terbuka tetapi tombol mulai akan menampilkan petunjuk pemasangan.":
+        "Actions that need root use pkexec, with a permission dialog on the "
+        "desktop. Hotspot support is optional; without the helper, the Hotspot "
+        "page still opens but the start button shows installation guidance.",
+    "Data hardware dibaca dari /sys dan NetworkManager. Pada distro tanpa "
+    "NetworkManager, daftar interface memakai fallback sysfs.":
+        "Hardware data is read from /sys and NetworkManager. On distros "
+        "without NetworkManager, the interface list falls back to sysfs.",
+
+    # App
+    "Status koneksi, pemulihan, dan jaringan sekitar":
+        "Card status, recovery, and nearby networks",
+    "Interface, rute, DNS, dan port lokal":
+        "Interfaces, routes, DNS, and local ports",
+    "Bagikan internet lewat AP Wi-Fi": "Share internet through a Wi-Fi AP",
+    "Hemat daya, driver, dan bahasa": "Power saving, driver, and language",
+    "Dashboard": "Dashboard",
+}
+
+
+def tr(text):
+    if LANG == "en" and isinstance(text, str):
+        return EN.get(text, text)
+    return text
+
+
+def system_language():
+    loc = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES")
+           or os.environ.get("LANG") or "")
+    if not loc:
+        try:
+            loc = locale.getlocale()[0] or ""
+        except Exception:
+            loc = ""
+    return "id" if loc.lower().startswith("id") else "en"
+
+
+def resolve_language(setting):
+    if setting in ("id", "en"):
+        return setting
+    return system_language()
+
+
+LANG = system_language()
+
+FONT = "Noto Sans"
+MONO = "Noto Sans Mono"
+BODY = 10
+SMALL = 9
+TINY = 8
+
+
+def sh(cmd, timeout=10, env=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env, stdin=subprocess.DEVNULL)
+        return ((p.stdout or "") + (p.stderr or "")).strip(), p.returncode
+    except subprocess.TimeoutExpired:
+        return "perintah melewati batas waktu", 124
+    except Exception as exc:  # noqa: BLE001
+        return str(exc), 1
+
+
+def sh_input(cmd, data, timeout=90):
+    """Jalankan perintah dengan stdin (untuk nmcli --ask, tanpa password di argv)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=data)
+        return ((p.stdout or "") + (p.stderr or "")).strip(), p.returncode
+    except subprocess.TimeoutExpired:
+        return "perintah melewati batas waktu", 124
+    except Exception as exc:  # noqa: BLE001
+        return str(exc), 1
+
+
+def pkexec(cmd, timeout=120):
+    return sh(["pkexec", "/usr/bin/bash", "-c", cmd], timeout=timeout)
+
+
+def load_hotspot_cfg():
+    cfg = dict(HOTSPOT_DEFAULTS)
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            cfg.update(data)
+    except Exception:
+        pass
+    if not isinstance(cfg.get("blacklist"), list):
+        cfg["blacklist"] = []
+    return cfg
+
+
+def save_hotspot_cfg(cfg):
+    try:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        with open(CFG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        os.chmod(CFG_PATH, 0o600)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ data
+def clip(text, width):
+    text = "" if text is None else str(text)
+    if len(text) <= width:
+        return text
+    return text[:max(1, width - 1)] + "…"
+
+
+def human_bytes_short(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 1024:
+        return "%d B" % n
+    for unit in ("K", "M", "G"):
+        n /= 1024.0
+        if n < 1024 or unit == "G":
+            return "%.1f%s" % (n, unit)
+    return "%.1fG" % n
+
+
+def human_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % n
+        n /= 1024
+
+
+def split_nmcli(line):
+    """Pecah output nmcli -t pada titik dua yang TIDAK di-escape."""
+    parts, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def read_text(path, default="—"):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def os_release_info():
+    data = {}
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                if "=" not in line:
+                    continue
+                k, v = line.rstrip("\n").split("=", 1)
+                data[k] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return {
+        "id": data.get("ID", "linux"),
+        "name": data.get("NAME", "Linux"),
+        "version": data.get("VERSION_ID", ""),
+        "pretty": data.get("PRETTY_NAME") or data.get("NAME") or "Linux",
+    }
+
+
+def package_manager():
+    for cmd in ("apt-get", "dnf", "yum", "pacman", "zypper", "apk",
+                "xbps-install"):
+        if shutil.which(cmd):
+            return cmd
+    return "—"
+
+
+def sysfs_devices():
+    rows = []
+    root = "/sys/class/net"
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return rows
+    for name in names:
+        if name == "lo":
+            continue
+        base = os.path.join(root, name)
+        wifi = os.path.isdir(os.path.join(base, "wireless"))
+        typ = "wifi" if wifi else "ethernet"
+        carrier = read_text(os.path.join(base, "carrier"), "0")
+        oper = read_text(os.path.join(base, "operstate"), "down")
+        connected = carrier == "1" and oper == "up"
+        rows.append({
+            "dev": name, "type": typ,
+            "state": "connected" if connected else "disconnected",
+            "conn": "",
+        })
+    return rows
+
+
+def wifi_driver(iface=None):
+    iface = iface or wifi_iface()
+    if not iface:
+        return "—"
+    path = "/sys/class/net/%s/device/driver" % iface
+    if os.path.exists(path):
+        return os.path.basename(os.path.realpath(path))
+    out, _ = sh(["ethtool", "-i", iface], timeout=4)
+    m = re.search(r"^driver:\s*(\S+)", out, re.M)
+    return m.group(1) if m else "—"
+
+
+def wifi_chip(iface=None):
+    iface = iface or wifi_iface()
+    out, _ = sh(["lspci", "-nn"], timeout=5)
+    lines = out.splitlines()
+    for line in lines:
+        low = line.lower()
+        if "network controller" in low or "wireless" in low:
+            return line.split(": ", 1)[-1][:90]
+    for line in lines:
+        if "ethernet controller" in line.lower():
+            return line.split(": ", 1)[-1][:90]
+    if iface:
+        uevent = read_text("/sys/class/net/%s/device/uevent" % iface)
+        for line in uevent.splitlines():
+            if line.startswith(("PCI_ID=", "PRODUCT=")):
+                return line.split("=", 1)[1]
+    return "—"
+
+
+def ap_support():
+    if not shutil.which("iw"):
+        return "?"
+    out, _ = sh(["iw", "list"], timeout=8)
+    return "AP" if "* AP" in out else "—"
+
+
+def hardware_info():
+    now = time.time()
+    cached = globals().get("_HW_CACHE")
+    if cached and now - cached.get("_ts", 0) < 60:
+        return cached
+    iface = wifi_iface()
+    data = {
+        "_ts": now,
+        "wifi_driver": wifi_driver(iface),
+        "wifi_chip": wifi_chip(iface),
+        "ap": ap_support(),
+    }
+    globals()["_HW_CACHE"] = data
+    return data
+
+
+def dev_list():
+    out, _ = sh(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])
+    rows = []
+    for line in out.splitlines():
+        parts = split_nmcli(line)
+        if len(parts) < 4:
+            continue
+        dev, typ, state, conn = parts[0], parts[1], parts[2], ":".join(parts[3:])
+        if typ in ("loopback",):
+            continue
+        rows.append({"dev": dev, "type": typ, "state": state, "conn": conn})
+    return rows or sysfs_devices()
+
+
+def dev_detail(dev):
+    info = {"ip4": "—", "ip6": "—", "mac": "—", "mtu": "—", "speed": "", "dns": [], "gw": ""}
+    out, _ = sh(["ip", "-o", "addr", "show", dev])
+    v4 = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
+    v6 = re.search(r"inet6 ([0-9a-f:]+/\d+)", out)
+    if v4:
+        info["ip4"] = v4.group(1)
+    if v6:
+        info["ip6"] = v6.group(1)
+    mac, rc = sh(["cat", "/sys/class/net/%s/address" % dev])
+    mtu, rc2 = sh(["cat", "/sys/class/net/%s/mtu" % dev])
+    if rc == 0 and mac:
+        info["mac"] = mac
+    if rc2 == 0 and mtu:
+        info["mtu"] = mtu
+    sp, rc = sh(["cat", "/sys/class/net/%s/speed" % dev])
+    if rc == 0 and sp.isdigit() and int(sp) > 0:
+        info["speed"] = "%s Mb/s" % sp
+    route, _ = sh(["ip", "route", "show", "dev", dev])
+    m = re.search(r"default via (\S+)", route)
+    if m:
+        info["gw"] = m.group(1)
+    dns, _ = sh(["nmcli", "-t", "-f", "IP4.DNS", "device", "show", dev])
+    for line in dns.splitlines():
+        if ":" in line:
+            val = line.split(":", 1)[1].strip()
+            if val and val not in info["dns"]:
+                info["dns"].append(val)
+    if not info["dns"]:
+        resolved, _ = sh(["resolvectl", "dns", dev], timeout=4)
+        for line in resolved.splitlines():
+            for val in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", line):
+                if val not in info["dns"]:
+                    info["dns"].append(val)
+    if not info["dns"]:
+        for line in read_text("/etc/resolv.conf").splitlines():
+            if line.startswith("nameserver"):
+                val = line.split()[1]
+                if val not in info["dns"]:
+                    info["dns"].append(val)
+    return info
+
+
+def counters(dev):
+    try:
+        with open("/sys/class/net/%s/statistics/rx_bytes" % dev) as fh:
+            rx = int(fh.read())
+        with open("/sys/class/net/%s/statistics/tx_bytes" % dev) as fh:
+            tx = int(fh.read())
+        return rx, tx
+    except OSError:
+        return 0, 0
+
+
+def wifi_iface():
+    for row in dev_list():
+        if row["type"] == "wifi":
+            return row["dev"]
+    for row in sysfs_devices():
+        if row["type"] == "wifi":
+            return row["dev"]
+    return ""
+
+
+def iw_link(iface):
+    info = {"ssid": "—", "freq": "—", "signal": "—", "rate": "—", "bssid": "—", "band": ""}
+    if not iface:
+        return info
+    out, _ = sh(["iw", "dev", iface, "link"], timeout=6)
+    if "Not connected" in out:
+        return info
+    m = re.search(r"Connected to ([0-9a-f:]+)", out)
+    if m:
+        info["bssid"] = m.group(1)
+    m = re.search(r"SSID:\s*(.+)", out)
+    if m:
+        info["ssid"] = m.group(1).strip()
+    m = re.search(r"freq:\s*([0-9.]+)", out)
+    if m:
+        f = float(m.group(1))
+        info["freq"] = "%s MHz" % m.group(1)
+        info["band"] = "5 GHz" if f > 4000 else "2.4 GHz"
+    m = re.search(r"signal:\s*(-?[0-9]+ dBm)", out)
+    if m:
+        info["signal"] = m.group(1)
+    m = re.search(r"tx bitrate:\s*([0-9.]+ [GMK]?Bit/s)", out)
+    if m:
+        info["rate"] = m.group(1)
+    if info["ssid"] == "—":
+        nm, _ = sh(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "device", "wifi", "list"])
+        for line in nm.splitlines():
+            parts = split_nmcli(line)
+            if len(parts) >= 3 and parts[0] == "yes":
+                info["ssid"] = parts[1]
+                info["signal"] = parts[2] + "%"
+                break
+    return info
+
+
+def powersave_global():
+    try:
+        with open(ZCONF, "r", encoding="utf-8") as fh:
+            m = re.search(r"wifi\.powersave\s*=\s*([0-9])", fh.read())
+    except OSError:
+        return "bawaan sistem"
+    if not m:
+        return "bawaan sistem"
+    return {"0": "bawaan", "1": "aktif", "2": "nonaktif", "3": "aktif"}.get(m.group(1), m.group(1))
+
+
+def conn_powersave():
+    out, _ = sh(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"])
+    rows = []
+    for line in out.splitlines():
+        parts = split_nmcli(line)
+        if len(parts) < 2 or parts[1] != "802-11-wireless":
+            continue
+        name = parts[0]
+        val, _ = sh(["nmcli", "-t", "-f", "802-11-wireless.powersave", "con", "show", name])
+        rows.append((name, val.split(":")[-1].strip() if ":" in val else "bawaan"))
+    return rows
+
+
+def watchdog_state():
+    if not shutil.which("systemctl"):
+        return {"enabled": "—", "active": "—", "last": "—", "next": "—"}
+    en, _ = sh(["systemctl", "is-enabled", "wifi-watchdog.timer"])
+    ac, _ = sh(["systemctl", "is-active", "wifi-watchdog.timer"])
+    last, _ = sh(["systemctl", "show", "-p", "LastTriggerUSec", "--value", "wifi-watchdog.timer"])
+    nxt, _ = sh(["systemctl", "show", "-p", "NextElapseUSecMonotonic", "--value", "wifi-watchdog.timer"])
+    return {"enabled": en.strip() or "?", "active": ac.strip() or "?",
+            "last": last.strip() or "—", "next": nxt.strip() or "—"}
+
+
+def modprobe_params():
+    opts = {}
+    driver = wifi_driver()
+    modules = ["rtw88_core", "rtw88_pci"]
+    if driver not in ("—", "", "?"):
+        modules.insert(0, driver)
+    for param in ("disable_lps_deep", "disable_aspm"):
+        value = "?"
+        for module in modules:
+            path = "/sys/module/%s/parameters/%s" % (module, param)
+            try:
+                with open(path) as fh:
+                    value = fh.read().strip()
+                break
+            except OSError:
+                continue
+        opts[param] = value
+    return opts
+
+
+def flood_stats(minutes=5):
+    out, _ = sh(["journalctl", "-k", "--since", "-%d min" % minutes, "--no-pager"], timeout=15)
+    return out.count("pci bus timeout"), out.count("failed to send h2c")
+
+
+def recent_log(lines=40):
+    out, _ = sh(["journalctl", "-k", "-n", "400", "--no-pager", "-o", "short-iso"], timeout=15)
+    iface = wifi_iface()
+    driver = wifi_driver(iface)
+    keys = [k for k in (iface, driver, "wifi-watchdog", "firmware") if k]
+    keep = [ln for ln in out.splitlines()
+            if any(k in ln for k in keys) or "wifi" in ln.lower()]
+    return "\n".join(keep[-lines:])
+
+
+def host_info():
+    def first(cmd):
+        out, _ = sh(cmd)
+        return out.splitlines()[0].strip() if out else "—"
+    up = ""
+    try:
+        with open("/proc/uptime") as fh:
+            secs = int(float(fh.read().split()[0]))
+        d, rem = divmod(secs, 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        up = ("%d hari " % d if d else "") + "%d jam %d mnt" % (h, m)
+    except OSError:
+        up = "—"
+    rel = os_release_info()
+    hw = hardware_info()
+    hostname, host_rc = sh(["hostname"])
+    hostname = hostname.splitlines()[0].strip() if hostname else ""
+    if host_rc != 0 or not hostname:
+        hostname = read_text("/proc/sys/kernel/hostname")
+    return {
+        "host": hostname or "—",
+        "kernel": os.uname().release,
+        "distro": rel["pretty"],
+        "distro_id": rel["id"],
+        "pkg": package_manager(),
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP")
+        or os.environ.get("DESKTOP_SESSION")
+        or "—",
+        "uptime": up,
+        "wifi_driver": hw["wifi_driver"],
+        "wifi_chip": hw["wifi_chip"],
+        "ap": hw["ap"],
+    }
+
+
+def collect():
+    devs = dev_list()
+    for row in devs:
+        row.update(dev_detail(row["dev"]))
+        row["rx"], row["tx"] = counters(row["dev"])
+    iface = next((r["dev"] for r in devs if r["type"] == "wifi"), "")
+    route, _ = sh(["ip", "route", "show", "default"])
+    default_dev, default_gw = "", ""
+    m = re.search(r"default via (\S+) dev (\S+)", route)
+    if m:
+        default_gw, default_dev = m.group(1), m.group(2)
+    ports, _ = sh(["ss", "-ltnH"])
+    port_rows = []
+    for line in ports.splitlines():
+        p = line.split()
+        if len(p) >= 4:
+            port_rows.append((p[3], p[0]))
+    pci = ""
+    if iface:
+        dp = os.path.realpath("/sys/class/net/%s/device" % iface)
+        if dp.startswith("/sys/devices"):
+            pci = os.path.basename(dp)
+    radio_status, _ = sh(["nmcli", "-t", "-f", "WIFI", "general", "status"])
+    return {
+        "devices": devs,
+        "radio": radio_status.strip() or "?",
+        "iface": iface,
+        "pci": pci,
+        "wifi": iw_link(iface),
+        "default_dev": default_dev or "—",
+        "default_gw": default_gw or "—",
+        "routes": [ln for ln in route.splitlines() if ln.startswith("default")],
+        "ps_global": powersave_global(),
+        "ps_conn": conn_powersave(),
+        "wd": watchdog_state(),
+        "params": modprobe_params(),
+        "flood": flood_stats(),
+        "ports": port_rows[:12],
+        "host": host_info(),
+    }
+
+
+class HotspotClient:
+    """Klien helper root hotspot (pkexec + JSON per baris)."""
+
+    def __init__(self):
+        self.proc = None
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.stderr = []
+
+    @property
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        if self.alive:
+            return
+        if not os.path.exists(HOTSPOT_HELPER):
+            raise RuntimeError("Helper hotspot belum dipasang")
+        if not os.access(HOTSPOT_HELPER, os.X_OK):
+            raise RuntimeError("Helper hotspot tidak executable")
+        self.proc = subprocess.Popen(
+            ["pkexec", HOTSPOT_HELPER],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1)
+        threading.Thread(target=self._read_stdout,
+                         args=(self.proc.stdout,), daemon=True).start()
+        threading.Thread(target=self._read_stderr,
+                         args=(self.proc.stderr,), daemon=True).start()
+
+    def _read_stdout(self, stream):
+        try:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    msg = {"ok": False, "error": line}
+                if isinstance(msg, dict):
+                    msg["_event"] = "message"
+                    self.q.put(msg)
+        finally:
+            self.q.put({"event": "exit",
+                        "code": self.proc.poll() if self.proc else None})
+
+    def _read_stderr(self, stream):
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+            self.stderr.append(line)
+            if len(self.stderr) > 30:
+                self.stderr.pop(0)
+
+    def send(self, **cmd):
+        self.start()
+        with self.lock:
+            if not self.proc or self.proc.poll() is not None:
+                raise RuntimeError("Helper hotspot tidak berjalan")
+            self.proc.stdin.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+
+    def close(self):
+        if not self.alive:
+            return
+        try:
+            with self.lock:
+                self.proc.stdin.write('{"cmd":"quit"}\n')
+                self.proc.stdin.flush()
+            self.proc.wait(timeout=2)
+        except Exception:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------------ widgets
+class Card(tk.Frame):
+    def __init__(self, master, title, subtitle="", accent=None):
+        super().__init__(master, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, bd=0)
+        head = tk.Frame(self, bg=CARD)
+        head.pack(fill="x", padx=16, pady=(14, 0))
+        if accent:
+            bar = tk.Frame(head, bg=accent, width=3, height=15)
+            bar.pack(side="left", padx=(0, 9), pady=1)
+            bar.pack_propagate(False)
+        tk.Label(head, text=title, bg=CARD, fg=FG,
+                 font=(FONT, 11, "bold"), anchor="w").pack(side="left")
+        self.sub_lbl = None
+        if subtitle:
+            self.sub_lbl = tk.Label(head, text=subtitle, bg=CARD, fg=MUT,
+                                    font=(FONT, TINY), anchor="e")
+            self.sub_lbl.pack(side="right")
+        self.body = tk.Frame(self, bg=CARD)
+        self.body.pack(fill="both", expand=True, padx=16, pady=(10, 14))
+
+    def row(self, label, value="—", key=None, width=16, mono=False,
+            color=FG):
+        f = tk.Frame(self.body, bg=CARD)
+        f.pack(fill="x", pady=1)
+        tk.Label(f, text=label, bg=CARD, fg=MUT,
+                 font=(FONT, SMALL), width=width, anchor="w").pack(side="left")
+        lbl = tk.Label(f, text=value, bg=CARD, fg=color,
+                       font=(MONO if mono else FONT, SMALL), anchor="w")
+        lbl.pack(side="left", fill="x", expand=True)
+        if key:
+            self.vals[key] = lbl
+        return lbl
+
+    def set_subtitle(self, text):
+        if self.sub_lbl is not None:
+            self.sub_lbl.configure(text=text)
+
+
+def card(master, *a, **kw):
+    c = Card(master, *a, **kw)
+    c.vals = {}
+    return c
+
+
+def dot(parent, color=GREEN, size=9):
+    c = tk.Canvas(parent, width=size, height=size, bg=parent["bg"],
+                  highlightthickness=0, bd=0)
+    c.create_oval(0, 0, size - 1, size - 1, fill=color, outline=color)
+    return c
+
+
+def field_label(parent, text):
+    return tk.Label(parent, text=text, bg=CARD, fg=MUT,
+                    font=(FONT, SMALL), anchor="w")
+
+
+def entry(parent, textvariable, show=None):
+    return tk.Entry(parent, textvariable=textvariable, show=show, bg=INPUT,
+                    fg=FG, insertbackground=FG, relief="flat",
+                    highlightthickness=1, highlightbackground=BORDER,
+                    highlightcolor=ACCENT, font=(FONT, BODY),
+                    bd=0)
+
+
+def combo(parent, values, textvariable=None, width=18):
+    box = ttk.Combobox(parent, values=values, textvariable=textvariable,
+                       state="readonly", width=width, font=(FONT, BODY))
+    return box
+
+
+def style_tree(widget, name="Dik.Treeview"):
+    st = ttk.Style(widget)
+    try:
+        st.theme_use("clam")
+    except Exception:
+        pass
+    st.configure(name, background=CARD, fieldbackground=CARD, foreground=FG,
+                 borderwidth=0, rowheight=29, font=(FONT, SMALL))
+    st.configure(name + ".Heading", background=CARD_ALT, foreground=MUT,
+                 relief="flat", borderwidth=0, font=(FONT, TINY, "bold"))
+    st.map(name, background=[("selected", ACCENT)],
+           foreground=[("selected", "#ffffff")])
+    st.configure("Dik.Vertical.TScrollbar", background=CARD_ALT,
+                 troughcolor=BG, bordercolor=BG, arrowcolor=MUT, width=11,
+                 darkcolor=CARD_ALT, lightcolor=CARD_ALT,
+                 relief="flat")
+    st.configure("TCombobox", fieldbackground=INPUT, background=CARD_ALT,
+                 foreground=FG, arrowcolor=MUT, bordercolor=BORDER,
+                 lightcolor=BORDER, darkcolor=BORDER, padding=4)
+    st.map("TCombobox",
+           fieldbackground=[("readonly", INPUT)],
+           foreground=[("readonly", FG)],
+           selectbackground=[("readonly", INPUT)],
+           selectforeground=[("readonly", FG)])
+    return st
+
+
+# ------------------------------------------------------------------ pages
+class Dashboard(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", pady=(0, 14))
+        for i in range(3):
+            top.columnconfigure(i, weight=1, uniform="dash")
+
+        self.c_inet = card(top, tr("Koneksi internet"), tr("Sumber aktif"),
+                           ACCENT)
+        self.c_inet.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        self.c_inet.row(tr("Interface"), key="dev", width=13)
+        self.c_inet.row(tr("Jenis"), key="type")
+        self.c_inet.row(tr("IP lokal"), key="ip", mono=True)
+        self.c_inet.row(tr("Gateway"), key="gw", mono=True)
+        self.c_inet.row(tr("DNS"), key="dns")
+
+        self.c_wifi = card(top, "Wi-Fi", tr("kartu nirkabel"), GREEN)
+        self.c_wifi.grid(row=0, column=1, sticky="nsew", padx=7)
+        self.c_wifi.row("SSID", key="ssid")
+        self.c_wifi.row(tr("Sinyal"), key="signal")
+        self.c_wifi.row(tr("Band"), key="band")
+        self.c_wifi.row(tr("Kecepatan"), key="rate")
+        self.c_wifi.row(tr("Hemat daya"), key="ps")
+
+        self.c_link = card(top, tr("LAN / USB"), tr("kabel & tethering"),
+                           PURPLE)
+        self.c_link.grid(row=0, column=2, sticky="nsew", padx=(7, 0))
+        self.c_link.row(tr("Interface"), key="dev", width=13)
+        self.c_link.row(tr("Jenis"), key="type")
+        self.c_link.row(tr("Kecepatan link"), key="speed")
+        self.c_link.row(tr("IP lokal"), key="ip", mono=True)
+        self.c_link.row(tr("Status"), key="state")
+
+        mid = tk.Frame(self, bg=BG)
+        mid.pack(fill="x", pady=(0, 14))
+        mid.columnconfigure(0, weight=2, uniform="mid")
+        mid.columnconfigure(1, weight=1, uniform="mid")
+        self.c_devs = card(mid, tr("Semua koneksi"), "nmcli", BLUE)
+        self.c_devs.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        self.dev_rows = tk.Frame(self.c_devs.body, bg=CARD)
+        self.dev_rows.pack(fill="both", expand=True)
+
+        self.c_traf = card(mid, tr("Trafik"), tr("per detik"), ORANGE)
+        self.c_traf.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self.traf_rows = tk.Frame(self.c_traf.body, bg=CARD)
+        self.traf_rows.pack(fill="x")
+
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="x")
+        bottom.columnconfigure(0, weight=1, uniform="bot")
+        bottom.columnconfigure(1, weight=1, uniform="bot")
+        self.c_net = card(bottom, tr("Rute default"), tr("gateway aktif"))
+        self.c_net.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        self.route_lbl = tk.Label(self.c_net.body, text="—", bg=CARD, fg=FG,
+                                  font=(MONO, SMALL), anchor="w",
+                                  justify="left")
+        self.route_lbl.pack(fill="x")
+
+        self.c_ports = card(bottom, tr("Port lokal (listen)"), "ss -ltn")
+        self.c_ports.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self.port_lbl = tk.Label(self.c_ports.body, text="—", bg=CARD, fg=MUT,
+                                 font=(MONO, SMALL), anchor="w", justify="left")
+        self.port_lbl.pack(fill="x")
+
+    def apply(self, st):
+        devs = st["devices"]
+        primary = next((d for d in devs if d["dev"] == st["default_dev"]), None)
+        if primary:
+            self.c_inet.vals["dev"].configure(text=primary["dev"], fg=FG)
+            self.c_inet.vals["type"].configure(text=tr(primary["type"]))
+            self.c_inet.vals["ip"].configure(text=primary["ip4"])
+            self.c_inet.vals["gw"].configure(text=st["default_gw"])
+            self.c_inet.vals["dns"].configure(
+                text=", ".join(primary["dns"][:3]) or "—")
+        else:
+            for k in ("dev", "type", "ip", "gw", "dns"):
+                self.c_inet.vals[k].configure(
+                    text="—", fg=RED if k == "dev" else FG)
+
+        w = st["wifi"]
+        wifi_row = next((d for d in devs if d["type"] == "wifi"), None)
+        wstate = wifi_row["state"] if wifi_row else tr("tidak ada")
+        connected = wstate.startswith("connected")
+        self.c_wifi.vals["ssid"].configure(
+            text=w["ssid"] if connected else tr(wstate),
+            fg=FG if connected else RED)
+        self.c_wifi.vals["signal"].configure(text=w["signal"])
+        self.c_wifi.vals["band"].configure(text=w["band"] or "—")
+        self.c_wifi.vals["rate"].configure(text=w["rate"])
+        self.c_wifi.vals["ps"].configure(
+            text=tr(st["ps_global"]),
+            fg=GREEN if st["ps_global"] == "nonaktif" else ORANGE)
+
+        link = next((d for d in devs if d["type"] == "ethernet"
+                     and d["state"].startswith("connected")), None)
+        if link:
+            self.c_link.vals["dev"].configure(text=link["dev"])
+            self.c_link.vals["type"].configure(text=tr("ethernet / USB"))
+            self.c_link.vals["speed"].configure(text=link["speed"] or "—")
+            self.c_link.vals["ip"].configure(text=link["ip4"])
+            self.c_link.vals["state"].configure(text=tr(link["state"]),
+                                                fg=GREEN)
+        else:
+            for k in ("dev", "type", "speed", "ip", "state"):
+                self.c_link.vals[k].configure(text="—", fg=MUT)
+
+        for wdg in self.dev_rows.winfo_children():
+            wdg.destroy()
+        header = (tr("Perangkat"), tr("Jenis"), tr("Status"), tr("Profil"),
+                  "IP")
+        hrow = tk.Frame(self.dev_rows, bg=CARD)
+        hrow.pack(fill="x", pady=(0, 3))
+        for text, w in zip(header, (20, 13, 20, 24, 0)):
+            tk.Label(hrow, text=text, bg=CARD, fg=DIM, font=(FONT, TINY),
+                     width=w, anchor="w").pack(side="left")
+        for d in devs:
+            row = tk.Frame(self.dev_rows, bg=CARD)
+            row.pack(fill="x", pady=1)
+            on = d["state"].startswith("connected")
+            vals = ((clip(d["dev"], 19), 20, MONO, FG),
+                    (clip(tr(d["type"]), 12), 13, FONT, MUT),
+                    (clip(tr(d["state"].split()[0]), 19), 20, FONT,
+                     GREEN if on else MUT),
+                    (clip(d["conn"] or "—", 23), 24, FONT, FG))
+            for val, w, fnt, color in vals:
+                tk.Label(row, text=val, bg=CARD, fg=color,
+                         font=(fnt, TINY), width=w, anchor="w").pack(side="left")
+            tk.Label(row, text=d["ip4"], bg=CARD, fg=BLUE,
+                     font=(MONO, TINY), anchor="w").pack(
+                side="left", fill="x", expand=True)
+
+        for wdg in self.traf_rows.winfo_children():
+            wdg.destroy()
+        kinds = {d["dev"]: d["type"] for d in st["devices"]}
+        for dev, (rx_bps, tx_bps) in sorted(self.app.rates.items()):
+            if kinds.get(dev) not in ("wifi", "ethernet", "tun"):
+                continue
+            row = tk.Frame(self.traf_rows, bg=CARD)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=dev, bg=CARD, fg=FG, font=(MONO, SMALL),
+                     width=16, anchor="w").pack(side="left")
+            tk.Label(row, text="↓ %s   ↑ %s" % (
+                human_bytes_short(rx_bps), human_bytes_short(tx_bps)),
+                bg=CARD, fg=BLUE, font=(FONT, SMALL), anchor="w").pack(
+                    side="left", fill="x", expand=True)
+        if not any(k in ("wifi", "ethernet", "tun") for k in kinds.values()):
+            tk.Label(self.traf_rows, text=tr("Belum ada trafik"),
+                     bg=CARD, fg=MUT, font=(FONT, SMALL),
+                     anchor="w").pack(fill="x")
+
+        if st["default_gw"] != "—":
+            self.route_lbl.configure(
+                text="%s  →  %s\nvia %s" % (st["default_dev"],
+                                             st["default_gw"],
+                                             st["default_dev"]))
+        else:
+            self.route_lbl.configure(text=tr("tanpa rute default"))
+
+        ports_seen, ports_lines = set(), []
+        for addr, _proto in st["ports"]:
+            addr = re.sub(r"%[^:]+", "", addr)
+            if addr in ports_seen:
+                continue
+            ports_seen.add(addr)
+            ports_lines.append("  " + addr)
+        self.port_lbl.configure(
+            text="\n".join(ports_lines[:7]) or "—")
+
+
+class WifiPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+        grid = tk.Frame(self, bg=BG)
+        grid.pack(fill="both", expand=True)
+        grid.columnconfigure(0, weight=1, uniform="wifi")
+        grid.columnconfigure(1, weight=1, uniform="wifi")
+        grid.rowconfigure(0, weight=1)
+
+        left = tk.Frame(grid, bg=BG)
+        right = tk.Frame(grid, bg=BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+
+        c1 = card(left, tr("Status koneksi"), "—", GREEN)
+        c1.pack(fill="x", pady=(0, 12))
+        self.c1 = c1
+        for key, label in (("state", tr("Status kartu")),
+                           ("radio", tr("Radio")),
+                           ("iface", tr("Interface")),
+                           ("ssid", "SSID"),
+                           ("signal", tr("Sinyal")),
+                           ("freq", tr("Frekuensi")),
+                           ("rate", tr("Kecepatan")),
+                           ("ip", tr("IP lokal")),
+                           ("route", tr("Jalur internet"))):
+            c1.row(label, key=key, width=17)
+        self.flood_lbl = c1.row(tr("Error 5 menit"), width=17)
+
+        c2 = card(left, "Watchdog", "wifi-watchdog.timer", ORANGE)
+        c2.pack(fill="x")
+        self.c2 = c2
+        for key, label in (("wd_en", tr("Status")),
+                           ("wd_active", tr("Timer")),
+                           ("wd_last", tr("Terakhir jalan")),
+                           ("wd_next", tr("Berikutnya"))):
+            c2.row(label, key=key, width=17)
+        btns = tk.Frame(c2.body, bg=CARD)
+        btns.pack(fill="x", pady=(10, 0))
+        self.app.button(btns, tr("Aktifkan"), lambda: self.app.wd("enable"),
+                        "primary").pack(side="left", padx=(0, 6))
+        self.app.button(btns, tr("Matikan"), lambda: self.app.wd("disable"),
+                        "danger").pack(side="left", padx=(0, 6))
+        self.app.button(btns, tr("Jalankan sekarang"),
+                        lambda: self.app.wd("run")).pack(side="left")
+
+        c4 = card(right, tr("Pemulihan"), tr("tanpa driver luar"), PURPLE)
+        c4.pack(fill="x", pady=(0, 12))
+        self.c4 = c4
+        btns = tk.Frame(c4.body, bg=CARD)
+        btns.pack(fill="x")
+        self.app.button(btns, tr("Reset WiFi"), lambda: self.app.reset(),
+                        "danger").pack(side="left", padx=(0, 6))
+        self.app.button(btns, tr("Cek cepat"), lambda: self.app.check()).pack(
+            side="left", padx=(0, 6))
+        self.app.button(btns, tr("Scan ulang"), lambda: self.app.scan()).pack(
+            side="left")
+        self.app.button(c4.body, tr("Matikan / nyalakan radio WiFi"),
+                        lambda: self.app.radio()).pack(fill="x", pady=(8, 0))
+        tk.Label(c4.body, text=tr("Reset memakai jalur aman: lepas driver "
+                                  "in-kernel + reset PCI."),
+                 bg=CARD, fg=MUT, font=(FONT, TINY), wraplength=430,
+                 justify="left", anchor="w").pack(fill="x", pady=(7, 0))
+
+        c_scan = card(right, tr("Jaringan WiFi"), tr("scan & konek"), BLUE)
+        c_scan.pack(fill="both", expand=True, pady=(0, 12))
+        self.c_scan = c_scan
+        self.networks = []
+        self.scan_list = tk.Listbox(
+            c_scan.body, height=6, bg=INPUT, fg=FG, selectbackground=ACCENT,
+            selectforeground="#ffffff", relief="flat", font=(MONO, SMALL),
+            activestyle="none", highlightthickness=1,
+            highlightbackground=BORDER, bd=0)
+        self.scan_list.pack(fill="both", expand=True)
+        self.scan_list.bind("<Double-Button-1>",
+                            lambda e: self.app.connect_selected())
+        btns = tk.Frame(c_scan.body, bg=CARD)
+        btns.pack(fill="x", pady=(8, 0))
+        self.app.button(btns, tr("Scan ulang"),
+                        lambda: self.app.scan_networks()).pack(
+                            side="left", padx=(0, 6))
+        self.app.button(btns, tr("Hubungkan"),
+                        lambda: self.app.connect_selected(),
+                        "primary").pack(side="left", padx=(0, 6))
+        self.app.button(btns, tr("Buka halaman login"),
+                        lambda: self.app.open_portal()).pack(side="left")
+        url_row = tk.Frame(c_scan.body, bg=CARD)
+        url_row.pack(fill="x", pady=(7, 0))
+        self.url_entry = entry(url_row, tk.StringVar())
+        self.url_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.app.button(url_row, tr("Buka"),
+                        lambda: self.app.open_portal()).pack(
+                            side="left", padx=(6, 0))
+        self.portal_lbl = tk.Label(c_scan.body, text=tr("Portal:") + " —",
+                                   bg=CARD, fg=MUT, font=(FONT, TINY),
+                                   anchor="w", justify="left",
+                                   wraplength=430)
+        self.portal_lbl.pack(fill="x", pady=(6, 0))
+        self.scan_lbl = tk.Label(c_scan.body, text=tr("belum scan"),
+                                 bg=CARD, fg=DIM, font=(FONT, TINY),
+                                 anchor="w")
+        self.scan_lbl.pack(fill="x")
+
+        c_info = card(right, tr("Info perangkat"), "—")
+        c_info.pack(fill="x")
+        self.c_info = c_info
+        c_info.row("PCI", key="pci", mono=True, width=13)
+        c_info.row("MAC", key="mac", mono=True, width=13)
+        c_info.row("MTU", key="mtu", width=13)
+        c_info.row("BSSID", key="bssid", mono=True, width=13)
+        c_info.row(tr("Hemat daya"), key="ps", width=13)
+        c_info.row(tr("Chip"), key="chip", width=13)
+        c_info.row(tr("Dukungan AP"), key="ap", width=13)
+
+        c6 = card(self, tr("Log kernel (Wi-Fi)"), tr("40 baris terakhir"),
+                ORANGE)
+        c6.pack(fill="both", expand=True, pady=(12, 0))
+        self.log = tk.Text(c6.body, height=6, bg=INPUT, fg="#c9d1d9",
+                           insertbackground=FG, relief="flat",
+                           font=(MONO, TINY), wrap="none", padx=10, pady=8,
+                           highlightthickness=1, highlightbackground=BORDER)
+        self.log.pack(fill="both", expand=True)
+        self.log.configure(state="disabled")
+
+    def apply(self, st):
+        devs = st["devices"]
+        wifi = next((d for d in devs if d["type"] == "wifi"), None)
+        w = st["wifi"]
+        conn_state = wifi["state"] if wifi else tr("tidak terdeteksi (wedge)")
+        self.c1.set_subtitle(st["host"].get("wifi_driver", "—"))
+        self.c1.vals["state"].configure(
+            text=tr(conn_state),
+            fg=GREEN if conn_state.startswith("connected") else RED)
+        self.c1.vals["radio"].configure(text=tr(st["radio"]))
+        self.c1.vals["iface"].configure(
+            text=wifi["dev"] if wifi else tr("tidak ada"))
+        self.c1.vals["ssid"].configure(text=w["ssid"])
+        self.c1.vals["signal"].configure(text=w["signal"])
+        self.c1.vals["freq"].configure(
+            text="%s (%s)" % (w["freq"], w["band"]) if w["band"] else w["freq"])
+        self.c1.vals["rate"].configure(text=w["rate"])
+        self.c1.vals["ip"].configure(text=wifi["ip4"] if wifi else "—")
+        self.c1.vals["route"].configure(
+            text="%s via %s" % (st["default_dev"], st["default_gw"])
+            if st["default_gw"] != "—" else "—")
+
+        pci, h2c = st["flood"]
+        self.flood_lbl.configure(
+            text="%d pci timeout · %d h2c" % (pci, h2c),
+            fg=(RED if pci > 100 else (ORANGE if (pci or h2c) else GREEN)))
+
+        wd = st["wd"]
+        self.c2.vals["wd_en"].configure(
+            text=tr(wd["enabled"]),
+            fg=GREEN if wd["enabled"] == "enabled" else RED)
+        self.c2.vals["wd_active"].configure(
+            text=tr(wd["active"]),
+            fg=GREEN if wd["active"] == "active" else MUT)
+        self.c2.vals["wd_last"].configure(text=wd["last"])
+        self.c2.vals["wd_next"].configure(text=wd["next"])
+
+        if wifi:
+            self.c_info.vals["pci"].configure(text=st["pci"] or "—")
+            self.c_info.vals["mac"].configure(text=wifi["mac"])
+            self.c_info.vals["mtu"].configure(text=wifi["mtu"])
+            self.c_info.vals["bssid"].configure(text=w["bssid"])
+        self.c_info.vals["ps"].configure(
+            text=tr(st["ps_global"]),
+            fg=GREEN if st["ps_global"] == "nonaktif" else ORANGE)
+        self.c_info.set_subtitle(st["host"].get("wifi_driver", "—"))
+        self.c_info.vals["chip"].configure(
+            text=clip(st["host"].get("wifi_chip", "—"), 48))
+        self.c_info.vals["ap"].configure(
+            text=tr(st["host"].get("ap", "?")))
+
+
+class NetworkPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+
+        self.c_dev = card(self, tr("Interface"), tr("detail per perangkat"),
+                          BLUE)
+        self.c_dev.pack(fill="both", expand=True, pady=(0, 12))
+        self.rows = tk.Frame(self.c_dev.body, bg=CARD)
+        self.rows.pack(fill="both", expand=True)
+
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="x")
+        bottom.columnconfigure(0, weight=1, uniform="net")
+        bottom.columnconfigure(1, weight=1, uniform="net")
+        self.c_route = card(bottom, tr("Rute default"), tr("gateway aktif"))
+        self.c_route.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        self.route_lbl = tk.Label(self.c_route.body, text="—", bg=CARD,
+                                  fg=FG, font=(MONO, SMALL), anchor="w",
+                                  justify="left", wraplength=440)
+        self.route_lbl.pack(fill="x")
+
+        self.c_dns = card(bottom, tr("DNS & MAC"), tr("perangkat aktif"))
+        self.c_dns.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self.dns_lbl = tk.Label(self.c_dns.body, text="—", bg=CARD, fg=FG,
+                                font=(MONO, SMALL), anchor="w", justify="left",
+                                wraplength=430)
+        self.dns_lbl.pack(fill="x")
+        self.mac_lbl = tk.Label(self.c_dns.body, text="—", bg=CARD, fg=MUT,
+                                font=(MONO, TINY), anchor="w", justify="left",
+                                wraplength=430)
+        self.mac_lbl.pack(fill="x", pady=(6, 0))
+
+        self.c_ports = card(self, tr("Port lokal (listen)"), "ss -ltn",
+                            ORANGE)
+        self.c_ports.pack(fill="both", expand=True, pady=(12, 0))
+        self.port_lbl = tk.Label(self.c_ports.body, text="—", bg=CARD,
+                                 fg=MUT, font=(MONO, SMALL), anchor="w",
+                                 justify="left")
+        self.port_lbl.pack(fill="x")
+
+    def apply(self, st):
+        for wdg in self.rows.winfo_children():
+            wdg.destroy()
+        heads = ((tr("Perangkat"), 17), (tr("Jenis"), 10),
+                 (tr("Status"), 18), (tr("Profil"), 22),
+                 (tr("IP / subnet"), 20), (tr("Gateway"), 15),
+                 ("MTU", 5))
+        hrow = tk.Frame(self.rows, bg=CARD)
+        hrow.pack(fill="x", pady=(0, 4))
+        for text, w in heads:
+            tk.Label(hrow, text=text, bg=CARD, fg=DIM, font=(FONT, TINY),
+                     width=w, anchor="w").pack(side="left")
+
+        for d in st["devices"]:
+            row = tk.Frame(self.rows, bg=CARD)
+            row.pack(fill="x", pady=1)
+            on = d["state"].startswith("connected")
+            raw = (d["dev"], tr(d["type"]), tr(d["state"].split()[0]),
+                   d["conn"] or "—", d["ip4"], d["gw"] or "—", d["mtu"])
+            vals = [clip(v, w - 1) for v, (_, w) in zip(raw, heads)]
+            for i, (val, (_, w)) in enumerate(zip(vals, heads)):
+                color = FG
+                if i == 2:
+                    color = GREEN if on else MUT
+                elif i == 4:
+                    color = BLUE
+                tk.Label(row, text=val, bg=CARD, fg=color,
+                         font=(MONO if i in (0, 4, 5, 6) else FONT, TINY),
+                         width=w, anchor="w").pack(side="left")
+
+        dns_only = "\n".join(
+            "%s  %s" % (clip(d["dev"], 18), clip(", ".join(d["dns"][:2]), 34))
+            for d in st["devices"] if d["dns"]) or "—"
+        self.dns_lbl.configure(text="DNS\n" + dns_only)
+        self.mac_lbl.configure(
+            text="MAC\n" + "\n".join(
+                "%s  %s" % (clip(d["dev"], 18), d["mac"])
+                for d in st["devices"]))
+        self.route_lbl.configure(
+            text="\n".join(st["routes"]) or tr("tanpa rute default"))
+
+        ports_seen, ports_lines = set(), []
+        for addr, _proto in st["ports"]:
+            addr = re.sub(r"%[^:]+", "", addr)
+            if addr in ports_seen:
+                continue
+            ports_seen.add(addr)
+            ports_lines.append("  " + addr)
+        self.port_lbl.configure(text="\n".join(ports_lines) or "—")
+
+
+class HotspotPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+        self.cfg = app.hs_cfg
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # --- status banner -------------------------------------------------
+        self.c_status = card(self, tr("Status Hotspot"), "AP + STA", GREEN)
+        self.c_status.grid(row=0, column=0, columnspan=2, sticky="ew",
+                           pady=(0, 14))
+        body = self.c_status.body
+        line = tk.Frame(body, bg=CARD)
+        line.pack(fill="x")
+        left = tk.Frame(line, bg=CARD)
+        left.pack(side="left", fill="x", expand=True)
+        self.state_lbl = tk.Label(left, text=tr("Nonaktif"), bg=CARD,
+                                  fg=MUT, font=(FONT, 21, "bold"),
+                                  anchor="w")
+        self.state_lbl.pack(anchor="w")
+        self.detail_lbl = tk.Label(left, text="", bg=CARD, fg=MUT,
+                                   font=(FONT, SMALL), anchor="w",
+                                   justify="left", wraplength=560)
+        self.detail_lbl.pack(anchor="w", pady=(2, 0))
+        self.msg_lbl = tk.Label(left, text="", bg=CARD, fg=ORANGE,
+                                font=(FONT, TINY), anchor="w",
+                                justify="left", wraplength=560)
+        self.msg_lbl.pack(anchor="w", pady=(4, 0))
+        self.toggle_btn = self.app.button(line, tr("Mulai Hotspot"),
+                                          self.app.hotspot_toggle, "primary")
+        self.toggle_btn.pack(side="right", padx=(14, 0))
+
+        sep = tk.Frame(body, bg=BORDER, height=1)
+        sep.pack(fill="x", pady=(12, 10))
+        stats = tk.Frame(body, bg=CARD)
+        stats.pack(fill="x")
+        for i in range(4):
+            stats.columnconfigure(i, weight=1, uniform="hsstat")
+        self.stat_ssid = self._stat(stats, 0, "SSID")
+        self.stat_sec = self._stat(stats, 1, tr("Keamanan"))
+        self.stat_src = self._stat(stats, 2, tr("Sumber"))
+        self.stat_clients = self._stat(stats, 3, tr("Client"))
+
+        left = tk.Frame(self, bg=BG)
+        left.grid(row=1, column=0, sticky="nw", padx=(0, 14))
+        right = tk.Frame(self, bg=BG)
+        right.grid(row=1, column=1, sticky="nsew")
+
+        # --- configuration --------------------------------------------------
+        self.c_cfg = card(left, tr("Konfigurasi Hotspot"),
+                          tr("SSID & keamanan"), ACCENT)
+        self.c_cfg.pack(fill="x")
+        form = self.c_cfg.body
+        form.columnconfigure(1, weight=1)
+        self.ssid_var = tk.StringVar(value=self.cfg.get("ssid", "DikNom Hotspot"))
+        self.pass_var = tk.StringVar(value=self.cfg.get("password", ""))
+        self.max_var = tk.IntVar(value=int(self.cfg.get("max_clients", 8)))
+        self.show_var = tk.BooleanVar(value=False)
+
+        def row_label(text, row):
+            tk.Label(form, text=text, bg=CARD, fg=MUT, font=(FONT, SMALL),
+                     anchor="w", width=13).grid(row=row, column=0,
+                                                sticky="w", pady=4)
+        row_label("SSID", 0)
+        entry(form, self.ssid_var).grid(row=0, column=1, sticky="ew",
+                                       ipady=4, pady=4)
+        row_label(tr("Password"), 1)
+        self.pass_entry = entry(form, self.pass_var, show="*")
+        self.pass_entry.grid(row=1, column=1, sticky="ew", ipady=4, pady=4)
+        tk.Checkbutton(form, text=tr("Tampilkan"), variable=self.show_var,
+                       command=self.toggle_password, bg=CARD, fg=MUT,
+                       activebackground=CARD, activeforeground=FG,
+                       selectcolor=INPUT, font=(FONT, TINY), bd=0,
+                       highlightthickness=0).grid(row=2, column=1,
+                                                  sticky="w", pady=(0, 4))
+
+        row_label(tr("Keamanan"), 3)
+        self.sec_map = {tr("WPA2"): "wpa2", tr("WPA3"): "wpa3",
+                        tr("WPA2/WPA3"): "wpa2wpa3",
+                        tr("Terbuka"): "open"}
+        self.sec_box = combo(form, list(self.sec_map), width=15)
+        saved_sec = self.cfg.get("security", "wpa2")
+        self.sec_box.set(next((k for k, v in self.sec_map.items()
+                               if v == saved_sec), tr("WPA2")))
+        self.sec_box.grid(row=3, column=1, sticky="w", pady=4)
+
+        row_label(tr("Maks. client"), 4)
+        spin = tk.Spinbox(form, from_=1, to=32, textvariable=self.max_var,
+                          width=5, bg=INPUT, fg=FG, buttonbackground=CARD,
+                          relief="flat", insertbackground=FG,
+                          highlightthickness=1, highlightbackground=BORDER,
+                          font=(FONT, BODY), bd=0)
+        spin.grid(row=4, column=1, sticky="w", pady=4)
+
+        row_label(tr("Sumber LAN/USB"), 5)
+        names = [d["dev"] for d in dev_list()
+                 if d.get("type") != "wifi"
+                 and d["dev"] not in ("lo", "ap0")
+                 and not d["dev"].startswith("tailscale")]
+        self.up_options = [(tr("Otomatis (LAN/USB)"), "auto")] + \
+                          [(n, n) for n in names]
+        self.up_box = combo(form, [x[0] for x in self.up_options], width=19)
+        saved_up = self.cfg.get("upstream", "auto")
+        self.up_box.set(next((k for k, v in self.up_options if v == saved_up),
+                              tr("Otomatis (LAN/USB)")))
+        self.up_box.grid(row=5, column=1, sticky="w", pady=4)
+
+        tk.Label(form, text=tr("Sementara sumber hanya LAN/USB. AP tetap "
+                               "memakai Wi-Fi (ap0) untuk client; uplink Wi-Fi "
+                               "dinonaktifkan agar koneksi host stabil."),
+                 bg=CARD, fg=MUT, font=(FONT, TINY), anchor="w",
+                 justify="left", wraplength=300).grid(
+                     row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        # --- blacklist ------------------------------------------------------
+        self.c_bl = card(left, tr("Daftar Blacklist"),
+                         tr("perangkat yang ditolak"), ORANGE)
+        self.c_bl.pack(fill="x", pady=(14, 0))
+        self.bl_list = tk.Listbox(
+            self.c_bl.body, height=3, bg=INPUT, fg=FG,
+            selectbackground=ACCENT, selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, font=(MONO, SMALL), bd=0)
+        self.bl_list.pack(fill="x")
+        self.bl_empty = tk.Label(self.c_bl.body, text=tr("Belum ada MAC."),
+                                 bg=CARD, fg=MUT, font=(FONT, TINY),
+                                 anchor="w")
+        bl_row = tk.Frame(self.c_bl.body, bg=CARD)
+        bl_row.pack(fill="x", pady=(7, 0))
+        self.bl_var = tk.StringVar()
+        ent = entry(bl_row, self.bl_var)
+        ent.pack(side="left", fill="x", expand=True, ipady=3)
+        self.app.button(bl_row, tr("Tambah"),
+                        self.app.hotspot_add_blacklist).pack(
+                            side="left", padx=(6, 0))
+        self.app.button(self.c_bl.body, tr("Hapus Blacklist"),
+                        self.app.hotspot_remove_blacklist,
+                        "danger").pack(fill="x", pady=(6, 0))
+
+        # --- clients --------------------------------------------------------
+        self.c_clients = card(right, tr("Client Terhubung"), tr("0 client"),
+                              PURPLE)
+        self.c_clients.pack(fill="both", expand=True)
+        bar = tk.Frame(self.c_clients.body, bg=CARD)
+        bar.pack(fill="x", pady=(0, 8))
+        self.count_lbl = tk.Label(bar, text="0 client", bg=CARD, fg=MUT,
+                                  font=(FONT, SMALL))
+        self.count_lbl.pack(side="left")
+        self.app.button(bar, tr("Segarkan"),
+                        self.app.hotspot_refresh).pack(
+                            side="right", padx=(5, 0))
+        self.app.button(bar, tr("Blacklist"),
+                        self.app.hotspot_blacklist_selected).pack(
+                            side="right", padx=(5, 0))
+        self.app.button(bar, tr("Putuskan"), self.app.hotspot_kick,
+                        "danger").pack(side="right", padx=(5, 0))
+
+        tree_wrap = tk.Frame(self.c_clients.body, bg=CARD)
+        tree_wrap.pack(fill="both", expand=True)
+        style_tree(tree_wrap)
+        cols = ("mac", "ip", "host", "signal", "time", "state")
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
+                                  style="Dik.Treeview", height=10,
+                                  selectmode="browse")
+        widths = (("mac", "MAC", 88, "w"), ("ip", "IP", 78, "w"),
+                  ("host", tr("Hostname"), 84, "w"),
+                  ("signal", tr("Sinyal"), 50, "e"),
+                  ("time", tr("Waktu"), 70, "e"),
+                  ("state", tr("Status"), 62, "e"))
+        for c, title, width, anchor in widths:
+            self.tree.heading(c, text=title)
+            self.tree.column(c, width=width, anchor=anchor,
+                             stretch=c == "host")
+        vsb = tk.Scrollbar(tree_wrap, orient="vertical",
+                           command=self.tree.yview, bg=BORDER,
+                           troughcolor=BG, activebackground=ACCENT,
+                           highlightbackground=BG, bd=0, width=12,
+                           relief="flat")
+        self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.tag_configure("odd", background=CARD_ALT)
+        self.tree.tag_configure("blocked", foreground=ORANGE)
+        self.empty_lbl = tk.Label(tree_wrap, text=tr("Belum ada client."),
+                                  bg=CARD, fg=MUT, font=(FONT, SMALL),
+                                  anchor="center")
+        self.empty_lbl.place(relx=0.5, rely=0.48, anchor="center")
+
+        self.render_blacklist()
+        self.render_state()
+
+    def _stat(self, parent, col, label):
+        box = tk.Frame(parent, bg=CARD)
+        box.grid(row=0, column=col, sticky="w", padx=(0, 16))
+        tk.Label(box, text=label, bg=CARD, fg=DIM, font=(FONT, TINY),
+                 anchor="w").pack(anchor="w")
+        val = tk.Label(box, text="—", bg=CARD, fg=FG,
+                       font=(FONT, SMALL, "bold"), anchor="w")
+        val.pack(anchor="w", pady=(2, 0))
+        return val
+
+    def toggle_password(self):
+        self.pass_entry.configure(show="" if self.show_var.get() else "*")
+
+    def get_config(self):
+        ssid = self.ssid_var.get().strip()
+        if not ssid:
+            self.app.info(tr("SSID tidak boleh kosong."))
+            return None
+        security = self.sec_map.get(self.sec_box.get(), "wpa2")
+        password = self.pass_var.get()
+        if security != "open" and len(password) < 8:
+            self.app.info(tr("Password minimal 8 karakter."))
+            return None
+        try:
+            max_clients = int(self.max_var.get())
+        except Exception:
+            max_clients = 8
+        max_clients = max(1, min(32, max_clients))
+        upstream = dict(self.up_options).get(self.up_box.get(), "auto")
+        self.cfg.update({"ssid": ssid, "password": password,
+                         "security": security, "max_clients": max_clients,
+                         "upstream": upstream})
+        save_hotspot_cfg(self.cfg)
+        return {"ssid": ssid, "password": password, "security": security,
+                "max_clients": max_clients, "upstream": upstream,
+                "blacklist": list(self.cfg.get("blacklist", []))}
+
+    def selected_mac(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return str(self.tree.item(sel[0], "values")[0])
+        except Exception:
+            return None
+
+    def render_clients(self, clients):
+        self.tree.delete(*self.tree.get_children())
+        for i, c in enumerate(clients):
+            secs = int(c.get("connected", 0))
+            conn = ("%d mnt" % (secs // 60) if secs >= 60
+                    else "%d dtk" % secs)
+            state = tr("Blacklist") if c.get("blacklisted") else tr("Terhubung")
+            self.tree.insert("", "end", values=(
+                c.get("mac", "-"), c.get("ip", "-"), c.get("hostname", "-"),
+                c.get("signal", "-"), conn, state),
+                tags=("blocked" if c.get("blacklisted")
+                      else ("odd" if i % 2 else ""),))
+        if clients:
+            self.empty_lbl.place_forget()
+        else:
+            self.empty_lbl.place(relx=0.5, rely=0.48, anchor="center")
+        self.update_count(len(clients))
+
+    def update_count(self, n=None):
+        if n is None:
+            n = len(self.tree.get_children())
+        maxn = self.app.hs_state.get("max_clients", self.max_var.get())
+        self.count_lbl.configure(
+            text=tr("%d client / %s") % (n, maxn))
+
+    def render_blacklist(self):
+        self.bl_list.delete(0, "end")
+        values = list(self.cfg.get("blacklist", []))
+        for mac in values:
+            self.bl_list.insert("end", mac)
+        if values:
+            self.bl_empty.pack_forget()
+        else:
+            self.bl_empty.pack(fill="x", pady=(4, 0))
+
+    def refresh_sources(self):
+        names = [d["dev"] for d in dev_list()
+                 if d.get("type") != "wifi"
+                 and d["dev"] not in ("lo", "ap0")
+                 and not d["dev"].startswith("tailscale")]
+        opts = [(tr("Otomatis (LAN/USB)"), "auto")] + [(n, n) for n in names]
+        vals = [x[0] for x in opts]
+        if vals == list(self.up_box.cget("values")):
+            return
+        cur = self.up_box.get()
+        self.up_options = opts
+        self.up_box.configure(values=vals)
+        if cur not in vals:
+            self.up_box.set(vals[0])
+
+    def render_state(self):
+        running = bool(self.app.hs_state.get("running"))
+        self.state_lbl.configure(
+            text=tr("Aktif") if running else tr("Nonaktif"),
+            fg=GREEN if running else MUT)
+        st = self.app.hs_state
+        if running:
+            self.detail_lbl.configure(text=tr(
+                "Hotspot berjalan. Client terhubung ke jaringan ini."))
+            self.stat_ssid.configure(text=st.get("ssid", "—"))
+            self.stat_sec.configure(text=str(st.get("security", "—")).upper())
+            self.stat_src.configure(text=st.get("upstream", "—"))
+            self.stat_clients.configure(
+                text="%s / %s" % (len(self.tree.get_children()),
+                                  st.get("max_clients", "—")))
+        else:
+            if not os.path.exists(HOTSPOT_HELPER):
+                self.detail_lbl.configure(
+                    text=tr("Helper hotspot belum dipasang. Jalankan "
+                            "sudo ./install-hotspot.sh dari folder tool."))
+            else:
+                self.detail_lbl.configure(
+                    text=tr("Uplink LAN/USB. AP Wi-Fi tetap tersedia untuk "
+                            "client; uplink Wi-Fi dinonaktifkan sementara."))
+            self.stat_ssid.configure(text=self.ssid_var.get() or "—")
+            self.stat_sec.configure(text=self.sec_box.get() or "—")
+            src = dict(self.up_options).get(self.up_box.get(), "auto")
+            self.stat_src.configure(
+                text=tr("Otomatis (LAN/USB)") if src == "auto" else src)
+            self.stat_clients.configure(text="0 / %s" % self.max_var.get())
+        self.msg_lbl.configure(text=tr(self.app.hs_message))
+        self.toggle_btn.configure(
+            text=tr("Hentikan Hotspot") if running else tr("Mulai Hotspot"),
+            state="disabled" if self.app.hs_busy else "normal",
+            bg=RED if running else ACCENT,
+            activebackground="#b91c1c" if running else "#2563eb")
+        self.update_count()
+
+    def apply(self, st):
+        pass
+
+
+class SettingsPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+
+        c0 = card(self, tr("Bahasa"), tr("Language"), ACCENT)
+        c0.pack(fill="x", pady=(0, 12))
+        row = tk.Frame(c0.body, bg=CARD)
+        row.pack(fill="x")
+        self.lang_buttons = {}
+        for value, label in (("auto", tr("Otomatis (sistem)")),
+                             ("id", tr("Indonesia")),
+                             ("en", tr("English"))):
+            active = self.app.cfg.get("language", "auto") == value
+            btn = tk.Button(
+                row, text=label, command=lambda v=value: self.app.set_language(v),
+                bg=ACCENT if active else CARD_ALT,
+                fg="#ffffff" if active else MUT,
+                activebackground=ACCENT, activeforeground="#ffffff",
+                relief="flat", bd=0, padx=14, pady=7,
+                font=(FONT, SMALL, "bold"), cursor="hand2")
+            btn.pack(side="left", padx=(0, 7))
+            self.lang_buttons[value] = btn
+        tk.Label(c0.body,
+                 text=tr("Otomatis mengikuti locale sistem. Perubahan langsung "
+                         "diterapkan ke seluruh halaman."),
+                 bg=CARD, fg=MUT, font=(FONT, TINY), anchor="w",
+                 justify="left", wraplength=780).pack(fill="x", pady=(9, 0))
+
+        c1 = card(self, tr("Hemat daya (powersave)"), "NetworkManager", GREEN)
+        c1.pack(fill="x", pady=(0, 12))
+        self.c1 = c1
+        c1.row(tr("Global"), key="ps_global", width=16)
+        self.conn_box = tk.Frame(c1.body, bg=CARD)
+        self.conn_box.pack(fill="x", pady=(4, 8))
+        btns = tk.Frame(c1.body, bg=CARD)
+        btns.pack(fill="x")
+        self.app.button(btns, tr("Nonaktifkan"), lambda: self.app.ps("2"),
+                        "primary").pack(side="left", padx=(0, 6))
+        self.app.button(btns, tr("Aktifkan (bawaan)"),
+                        lambda: self.app.ps("3")).pack(side="left")
+        tk.Label(c1.body, text=tr("Nonaktif = paling stabil untuk kartu ini. "
+                                  "Berlaku global dan untuk setiap profil WiFi."),
+                 bg=CARD, fg=MUT, font=(FONT, TINY), anchor="w",
+                 justify="left", wraplength=780).pack(fill="x", pady=(8, 0))
+
+        c2 = card(self, tr("Parameter driver"), tr("baca saja"), PURPLE)
+        c2.pack(fill="x", pady=(0, 12))
+        self.c2 = c2
+        c2.row("disable_lps_deep", key="p_lps", width=20)
+        c2.row("disable_aspm", key="p_aspm", width=20)
+        c2.row(tr("Sumber modul"), key="drv", width=20)
+
+        c3 = card(self, tr("Apa efek tiap pilihan"), tr("penjelasan"), ORANGE)
+        c3.pack(fill="x")
+        for title, text in (
+            (tr("Powersave nonaktif"),
+             tr("Kartu tidak masuk mode hemat daya. Ini setelan yang dipakai "
+                "sekarang dan yang membuat kartu jauh lebih jarang wedge.")),
+            (tr("Powersave aktif (bawaan)"),
+             tr("Mengembalikan perilaku bawaan NetworkManager. Hemat baterai "
+                "sedikit, tapi pada beberapa kartu Wi-Fi sering memicu macet dan daftar "
+                "WiFi kosong.")),
+            (tr("Parameter driver"),
+             tr("disable_lps_deep dan disable_aspm dibaca dari modul kernel "
+                "saat dimuat. Untuk mengubahnya perlu edit "
+                "/etc/modprobe.d/rtw88-powersave.conf lalu muat ulang driver "
+                "— di luar cakupan panel ini supaya aman.")),
+        ):
+            tk.Label(c3.body, text=title, bg=CARD, fg=FG,
+                     font=(FONT, SMALL, "bold"), anchor="w").pack(
+                         fill="x", pady=(4, 0))
+            tk.Label(c3.body, text=text, bg=CARD, fg=MUT, font=(FONT, TINY),
+                     wraplength=860, justify="left", anchor="w").pack(
+                         fill="x")
+
+        tk.Label(self, text=tr("Pengaturan disimpan otomatis di "
+                               "~/.config/diknom-network/config.json"),
+                 bg=BG, fg=DIM, font=(FONT, TINY), anchor="w").pack(
+                     fill="x", pady=(10, 0))
+
+    def apply(self, st):
+        self.c1.vals["ps_global"].configure(
+            text=tr(st["ps_global"]),
+            fg=GREEN if st["ps_global"] == "nonaktif" else ORANGE)
+        for wdg in self.conn_box.winfo_children():
+            wdg.destroy()
+        for name, val in st["ps_conn"]:
+            row = tk.Frame(self.conn_box, bg=CARD)
+            row.pack(fill="x")
+            tk.Label(row, text=name, bg=CARD, fg=FG,
+                     font=(FONT, SMALL)).pack(side="left")
+            tk.Label(row, text=tr(val), bg=CARD,
+                     fg=(GREEN if val == "disable" else MUT),
+                     font=(FONT, SMALL)).pack(side="right")
+        self.c2.vals["p_lps"].configure(
+            text=st["params"].get("disable_lps_deep", "?"))
+        self.c2.vals["p_aspm"].configure(
+            text=st["params"].get("disable_aspm", "?"))
+        self.c2.vals["drv"].configure(
+            text="in-tree · kernel %s" % os.uname().release)
+
+
+class AboutPage(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=BG)
+        self.app = app
+
+        c1 = card(self, tr("Tentang aplikasi"), "v" + VER, ACCENT)
+        c1.pack(fill="x", pady=(0, 12))
+        hero = tk.Frame(c1.body, bg=CARD)
+        hero.pack(fill="x")
+        left = tk.Frame(hero, bg=CARD)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text="DikNom System Network", bg=CARD, fg=FG,
+                 font=(FONT, 18, "bold"), anchor="w").pack(anchor="w")
+        tk.Label(left, text=tr("Panel jaringan ringan untuk Linux"),
+                 bg=CARD, fg=MUT, font=(FONT, SMALL), anchor="w").pack(
+                     anchor="w", pady=(2, 0))
+        dev = tk.Frame(hero, bg=CARD)
+        dev.pack(side="right", anchor="ne")
+        tk.Label(dev, text=tr("DEVELOPER"), bg=CARD, fg=DIM,
+                 font=(FONT, TINY, "bold"), anchor="e").pack(anchor="e")
+        tk.Label(dev, text="DikNom", bg=CARD, fg=BLUE,
+                 font=(FONT, 13, "bold"), anchor="e").pack(anchor="e")
+
+        intro = tr(
+            "Semua yang berhubungan dengan koneksi dan Wi-Fi dalam satu "
+            "panel: status internet, kartu Wi-Fi, LAN/USB, hotspot, trafik, "
+            "rute, DNS, pemulihan, dan pengaturan driver.")
+        tk.Label(c1.body, text=intro, bg=CARD, fg=FG, font=(FONT, SMALL),
+                 wraplength=840, justify="left", anchor="w").pack(
+                     fill="x", pady=(12, 10))
+
+        feats = tk.Frame(c1.body, bg=CARD)
+        feats.pack(fill="x")
+        feats.columnconfigure(0, weight=1, uniform="feat")
+        feats.columnconfigure(1, weight=1, uniform="feat")
+        items = (
+            (tr("Jaringan"), tr("Dashboard, interface, rute, DNS, dan port.")),
+            (tr("Wi-Fi"), tr("Status kartu, scan, pemulihan, dan driver.")),
+            (tr("Hotspot"), tr("AP Wi-Fi, client, batas client, dan blacklist.")),
+            (tr("Lintas distro"), tr("Installer dan deteksi hardware yang "
+                                    "tidak terikat satu distro.")),
+        )
+        for i, (title, text) in enumerate(items):
+            box = tk.Frame(feats, bg=CARD)
+            box.grid(row=i // 2, column=i % 2, sticky="nw",
+                     padx=(0, 16) if i % 2 == 0 else (16, 0),
+                     pady=3)
+            tk.Label(box, text=title, bg=CARD, fg=FG,
+                     font=(FONT, SMALL, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(box, text=text, bg=CARD, fg=MUT, font=(FONT, TINY),
+                     wraplength=390, justify="left", anchor="w").pack(
+                         anchor="w")
+
+        credit = tk.Frame(c1.body, bg=CARD)
+        credit.pack(fill="x", pady=(12, 0))
+        tk.Label(credit, text=tr("Dikembangkan oleh"), bg=CARD, fg=DIM,
+                 font=(FONT, TINY)).pack(side="left")
+        tk.Label(credit, text="DikNom", bg=CARD, fg=BLUE,
+                 font=(FONT, SMALL, "bold")).pack(side="left", padx=(5, 0))
+        tk.Label(credit, text="·  v" + VER, bg=CARD, fg=DIM,
+                 font=(FONT, TINY)).pack(side="left", padx=(8, 0))
+
+        c2 = card(self, tr("Mesin ini"), tr("deteksi otomatis"), BLUE)
+        c2.pack(fill="x", pady=(0, 12))
+        self.c2 = c2
+        self.host_vals = {}
+        c2.body.columnconfigure(0, weight=1, uniform="host")
+        c2.body.columnconfigure(1, weight=1, uniform="host")
+        fields = (("host", "Hostname"), ("kernel", "Kernel"),
+                  ("distro", tr("Distro")), ("pkg", tr("Paket")),
+                  ("desktop", "Desktop"), ("uptime", "Uptime"),
+                  ("wifi_driver", tr("Driver WiFi")),
+                  ("wifi_chip", tr("Chip WiFi")),
+                  ("ap", tr("Dukungan AP")))
+        for i, (key, label) in enumerate(fields):
+            box = tk.Frame(c2.body, bg=CARD)
+            box.grid(row=i // 2, column=i % 2, sticky="ew",
+                     padx=(0, 14) if i % 2 == 0 else (14, 0), pady=3)
+            tk.Label(box, text=label, bg=CARD, fg=MUT,
+                     font=(FONT, TINY), width=12, anchor="w").pack(side="left")
+            val = tk.Label(box, text="—", bg=CARD, fg=FG,
+                           font=(FONT, SMALL), anchor="w", justify="left",
+                           wraplength=285)
+            val.pack(side="left", fill="x", expand=True)
+            self.host_vals[key] = val
+
+        c3 = card(self, tr("Catatan"), tr("perawatan"), ORANGE)
+        c3.pack(fill="x")
+        tk.Label(c3.body, text=tr(
+            "Aksi yang membutuhkan root memakai pkexec, dengan dialog izin "
+            "di desktop. Instalasi hotspot bersifat opsional; tanpa helper, "
+            "halaman Hotspot tetap terbuka tetapi tombol mulai akan "
+            "menampilkan petunjuk pemasangan."),
+            bg=CARD, fg=MUT, font=(FONT, TINY), wraplength=840,
+            justify="left", anchor="w").pack(fill="x")
+        tk.Label(c3.body, text=tr(
+            "Data hardware dibaca dari /sys dan NetworkManager. Pada distro "
+            "tanpa NetworkManager, daftar interface memakai fallback sysfs."),
+            bg=CARD, fg=DIM, font=(FONT, TINY), wraplength=840,
+            justify="left", anchor="w").pack(fill="x", pady=(6, 0))
+
+    def apply(self, st):
+        for key, val in st.get("host", {}).items():
+            if key in self.host_vals:
+                text = val if val not in (None, "") else "—"
+                self.host_vals[key].configure(text=text)
+
+# ------------------------------------------------------------------ app
+PAGE_META = {
+    "dashboard": ("Dashboard", "Ringkasan koneksi, antarmuka, dan lalu lintas"),
+    "wifi": ("WiFi", "Status kartu, pemulihan, dan jaringan sekitar"),
+    "network": ("Jaringan", "Interface, rute, DNS, dan port lokal"),
+    "hotspot": ("Hotspot", "Bagikan internet lewat AP Wi-Fi"),
+    "settings": ("Pengaturan", "Hemat daya, driver, dan bahasa"),
+    "about": ("Tentang", "Tentang DikNom System Network"),
+}
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.q = queue.Queue()
+        self.pages = {}
+        self.current = None
+        self.rates = {}
+        self.prev = {}
+        self.prev_t = time.monotonic()
+        self.last_log = 0
+        self.cfg = load_hotspot_cfg()
+        self.hs_cfg = self.cfg
+        global LANG
+        LANG = resolve_language(self.hs_cfg.get("language", "auto"))
+        self.hs_client = HotspotClient()
+        self.hs_state = {}
+        self.hs_busy = False
+        self.hs_message = ""
+        self.hs_last_poll = 0.0
+
+        root.title(APP)
+        root.configure(bg=BG)
+        root.geometry("1140x720+60+30")
+        root.minsize(1020, 680)
+
+        self.build()
+        self.show("dashboard")
+        for idx, key in enumerate(("dashboard", "wifi", "network",
+                                   "hotspot", "settings", "about"), 1):
+            self.root.bind("<Control-Key-%d>" % idx,
+                           lambda e, k=key: self.show(k))
+        self.root.after(150, self.drain)
+        self.refresh()
+        self.tick()
+
+    # ---------- kerangka
+    def build(self):
+        self.shell = tk.Frame(self.root, bg=BG)
+        self.shell.pack(fill="both", expand=True)
+
+        self.side = tk.Frame(self.shell, bg=SIDEBAR, width=216)
+        self.side.pack(side="left", fill="y")
+        self.side.pack_propagate(False)
+        self.build_side()
+
+        right = tk.Frame(self.shell, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        head = tk.Frame(right, bg=BG)
+        head.pack(fill="x", padx=22, pady=(18, 4))
+        title_box = tk.Frame(head, bg=BG)
+        title_box.pack(side="left")
+        self.page_title = tk.Label(title_box, text="Dashboard", bg=BG, fg=FG,
+                                   font=(FONT, 21, "bold"), anchor="w")
+        self.page_title.pack(anchor="w")
+        self.page_sub = tk.Label(title_box, text="", bg=BG, fg=MUT,
+                                 font=(FONT, SMALL), anchor="w")
+        self.page_sub.pack(anchor="w", pady=(1, 0))
+        self.pill = tk.Label(head, text=tr("memuat…"), bg=CARD_ALT, fg=MUT,
+                             font=(FONT, TINY, "bold"), padx=14, pady=6)
+        self.pill.pack(side="right")
+
+        self.content = tk.Frame(right, bg=BG)
+        self.content.pack(fill="both", expand=True, padx=22, pady=(14, 8))
+        self.canvas = tk.Canvas(self.content, bg=BG, highlightthickness=0, bd=0)
+        self.vsb = tk.Scrollbar(self.content, orient="vertical",
+                                 command=self.canvas.yview, bg=BORDER,
+                                 troughcolor=BG, activebackground=ACCENT,
+                                 highlightbackground=BG, bd=0, width=12,
+                                 relief="flat")
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vsb.pack(side="right", fill="y")
+        self.host = tk.Frame(self.canvas, bg=BG)
+        self.host_window = self.canvas.create_window(
+            (0, 0), window=self.host, anchor="nw")
+        self.host.bind("<Configure>", self._scroll_region)
+        self.canvas.bind("<Configure>", self._scroll_width)
+        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
+        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+
+        bar = tk.Frame(right, bg=BG)
+        bar.pack(fill="x", padx=22, pady=(0, 12))
+        self.status = tk.Label(bar, text=tr("siap"), bg=BG, fg=MUT,
+                               font=(FONT, TINY), anchor="w")
+        self.status.pack(side="left")
+        tk.Label(bar, text="DikNom · " + APP + "  v" + VER, bg=BG, fg=DIM,
+                 font=(FONT, TINY)).pack(side="right")
+
+        try:
+            style_tree(self.root)
+        except Exception:
+            pass
+        self.pages["dashboard"] = Dashboard(self.host, self)
+        self.pages["wifi"] = WifiPage(self.host, self)
+        self.pages["network"] = NetworkPage(self.host, self)
+        self.pages["hotspot"] = HotspotPage(self.host, self)
+        self.pages["settings"] = SettingsPage(self.host, self)
+        self.pages["about"] = AboutPage(self.host, self)
+
+    def build_side(self):
+        brand = tk.Frame(self.side, bg=SIDEBAR)
+        brand.pack(fill="x", padx=18, pady=(22, 22))
+        mark = tk.Frame(brand, bg=SIDEBAR)
+        mark.pack(anchor="w")
+        tk.Frame(mark, bg=ACCENT, width=4, height=18).pack(
+            side="left", padx=(0, 9))
+        tk.Label(mark, text="DikNom", bg=SIDEBAR, fg=FG,
+                 font=(FONT, 15, "bold")).pack(side="left")
+        tk.Label(brand, text="System Network", bg=SIDEBAR, fg=ACCENT,
+                 font=(FONT, SMALL)).pack(anchor="w", padx=(13, 0), pady=(2, 0))
+        tk.Label(brand, text="v" + VER, bg=SIDEBAR, fg=DIM,
+                 font=(FONT, TINY)).pack(anchor="w", padx=(13, 0))
+
+        tk.Label(self.side, text=tr("MENU"), bg=SIDEBAR, fg=DIM,
+                 font=(FONT, TINY, "bold")).pack(anchor="w", padx=22,
+                                                 pady=(0, 7))
+        self.nav = {}
+        self.nav_labels = {}
+        self.nav_bars = {}
+        for key, icon, label in (
+                ("dashboard", "▦", tr("Dashboard")),
+                ("wifi", "◉", tr("WiFi")),
+                ("network", "⇄", tr("Jaringan")),
+                ("hotspot", "◈", tr("Hotspot")),
+                ("settings", "⚙", tr("Pengaturan")),
+                ("about", "ⓘ", tr("Tentang"))):
+            item = tk.Frame(self.side, bg=SIDEBAR, cursor="hand2")
+            item.pack(fill="x", padx=10, pady=1)
+            bar = tk.Frame(item, bg=SIDEBAR, width=3)
+            bar.pack(side="left", fill="y")
+            inner = tk.Frame(item, bg=SIDEBAR)
+            inner.pack(side="left", fill="x", expand=True, padx=(11, 8),
+                       pady=9)
+            ico = tk.Label(inner, text=icon, bg=SIDEBAR, fg=MUT,
+                           font=(FONT, 11), width=2, anchor="w")
+            ico.pack(side="left")
+            lab = tk.Label(inner, text=label, bg=SIDEBAR, fg=MUT,
+                           font=(FONT, 10), anchor="w")
+            lab.pack(side="left", padx=(4, 0))
+            for w in (item, inner, ico, lab):
+                w.bind("<Button-1>", lambda e, k=key: self.show(k))
+                w.bind("<Enter>", lambda e, k=key: self.hover(k, True))
+                w.bind("<Leave>", lambda e, k=key: self.hover(k, False))
+            self.nav[key] = item
+            self.nav_labels[key] = (ico, lab)
+            self.nav_bars[key] = bar
+
+        tk.Frame(self.side, bg=SIDEBAR).pack(fill="both", expand=True)
+
+        box = tk.Frame(self.side, bg=SIDEBAR)
+        box.pack(fill="x", padx=18, pady=(0, 18))
+        line = tk.Frame(box, bg=SIDEBAR)
+        line.pack(fill="x")
+        self.side_dot = dot(line, GREEN, 8)
+        self.side_dot.pack(side="left", padx=(0, 7))
+        tk.Label(line, text=tr("Terhubung"), bg=SIDEBAR, fg=MUT,
+                 font=(FONT, TINY)).pack(side="left")
+        self.side_iface = tk.Label(box, text="—", bg=SIDEBAR, fg=FG,
+                                   font=(MONO, TINY), anchor="w")
+        self.side_iface.pack(fill="x", pady=(7, 0))
+        self.side_ip = tk.Label(box, text="", bg=SIDEBAR, fg=BLUE,
+                                font=(MONO, TINY), anchor="w")
+        self.side_ip.pack(fill="x")
+
+    def _scroll_region(self, _event=None):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _scroll_width(self, event=None):
+        try:
+            self.canvas.itemconfigure(self.host_window, width=event.width)
+        except Exception:
+            pass
+
+    def _nav_style(self, key, active=False, hover=False):
+        bg = "#111b27" if active else ("#101821" if hover else SIDEBAR)
+        fg = FG if active else MUT
+        self.nav[key].configure(bg=bg)
+        for child in self.nav[key].winfo_children():
+            child.configure(bg=bg)
+            for sub in child.winfo_children():
+                if isinstance(sub, tk.Label):
+                    sub.configure(bg=bg)
+        self.nav_bars[key].configure(bg=ACCENT if active else bg)
+        for lab in self.nav_labels[key]:
+            lab.configure(fg=fg)
+
+    def hover(self, key, on):
+        if key == self.current:
+            return
+        self._nav_style(key, False, on)
+
+    def show(self, key):
+        if self.current == key:
+            return
+        if self.current:
+            self.pages[self.current].pack_forget()
+            self._nav_style(self.current, False, False)
+        self.current = key
+        self.pages[key].pack(fill="both", expand=True)
+        self._nav_style(key, True, False)
+        try:
+            self.canvas.yview_moveto(0)
+            self.canvas.update_idletasks()
+            self.canvas.itemconfigure(self.host_window,
+                                      width=self.canvas.winfo_width())
+        except Exception:
+            pass
+        meta = PAGE_META.get(key, ("", ""))
+        self.page_title.configure(text=tr(meta[0]))
+        self.page_sub.configure(text=tr(meta[1]))
+        if key == "wifi":
+            self.last_log = 0
+            self.bg(lambda: recent_log(), self.set_log)
+            self.check_portal()
+            self.scan_networks()
+        if key == "hotspot":
+            self.pages["hotspot"].render_state()
+            self.hotspot_refresh()
+        self.apply_last()
+
+    def button(self, master, text, cmd, kind="secondary"):
+        if kind == "primary":
+            bg, fg = ACCENT, "#ffffff"
+            hover, active = "#2563eb", "#1d4ed8"
+        elif kind == "danger":
+            bg, fg = "#3b2024", "#fca5a5"
+            hover, active = "#51262b", "#6b2b31"
+        elif kind == "ghost":
+            bg, fg = CARD, MUT
+            hover, active = CARD_ALT, CARD_ALT
+        else:
+            bg, fg = CARD_ALT, FG
+            hover, active = "#1b2735", "#202e3f"
+        btn = tk.Button(master, text=text, command=cmd, bg=bg, fg=fg,
+                        activebackground=active, activeforeground=fg,
+                        relief="flat", bd=0, padx=13, pady=7,
+                        font=(FONT, SMALL, "bold"), cursor="hand2",
+                        highlightthickness=0)
+        btn.bind("<Enter>", lambda e: btn.configure(bg=hover))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
+        return btn
+
+    def set_language(self, value):
+        global LANG
+        self.hs_cfg["language"] = value
+        save_hotspot_cfg(self.hs_cfg)
+        new = resolve_language(value)
+        if new != LANG:
+            LANG = new
+            self.rebuild()
+        else:
+            # Tetap bangun ulang agar tombol bahasa langsung mencerminkan pilihan.
+            self.rebuild()
+
+    def rebuild(self):
+        current = self.current or "dashboard"
+        self.current = None
+        for child in list(self.root.winfo_children()):
+            child.destroy()
+        self.pages = {}
+        self.nav = {}
+        self.nav_labels = {}
+        self.nav_bars = {}
+        self.build()
+        self.show(current)
+        self.apply_last()
+
+    # ---------- data
+    def drain(self):
+        try:
+            while True:
+                fn = self.q.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
+        self.root.after(150, self.drain)
+
+    def bg(self, fn, done=None):
+        def run():
+            try:
+                res = fn()
+            except Exception as exc:  # noqa: BLE001
+                res = str(exc)
+            self.q.put(self.refresh)
+            if done:
+                self.q.put(lambda: done(res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def say(self, text, color=MUT):
+        self.status.configure(text=text, fg=color)
+
+    def refresh(self):
+        def work():
+            st = collect()
+            now = time.monotonic()
+            dt = max(now - self.prev_t, 0.001)
+            rates = {}
+            for d in st["devices"]:
+                cur = (d["rx"], d["tx"])
+                old = self.prev.get(d["dev"])
+                if old:
+                    rates[d["dev"]] = ((cur[0] - old[0]) / dt,
+                                       (cur[1] - old[1]) / dt)
+                self.prev[d["dev"]] = cur
+            self.prev_t = now
+            self.q.put(lambda: self.apply(st, rates))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply(self, st, rates):
+        if rates:
+            self.rates = rates
+        self.last_state = st
+        page = self.pages.get(self.current)
+        if page is not None:
+            try:
+                page.apply(st)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+        devs = st["devices"]
+        wifi = next((d for d in devs if d["type"] == "wifi"), None)
+        eth = next((d for d in devs if d["type"] == "ethernet"
+                    and d["state"].startswith("connected")), None)
+        online = st["default_gw"] != "—"
+        if online:
+            self.pill.configure(text=tr("ONLINE"), bg="#12351f", fg=GREEN)
+        else:
+            self.pill.configure(text=tr("TANPA INTERNET"), bg="#3a1b1e",
+                                fg=RED)
+        try:
+            self.side_dot.itemconfigure(1, fill=GREEN if online else RED)
+        except Exception:
+            pass
+        parts = []
+        if wifi and wifi["state"].startswith("connected"):
+            parts.append(wifi["dev"])
+        if eth:
+            parts.append(eth["dev"])
+        self.side_iface.configure(
+            text=tr("aktif:") + " " + (", ".join(parts) or "—"))
+        self.side_ip.configure(
+            text=st["default_gw"] if online else "")
+
+        if self.current == "wifi":
+            now = time.monotonic()
+            if now - self.last_log > 5:
+                self.last_log = now
+                self.bg(lambda: recent_log(), lambda lg: self.set_log(lg))
+            if now - getattr(self, "last_portal", 0) > 20:
+                self.last_portal = now
+                self.check_portal()
+
+
+    def set_log(self, text):
+        w = self.pages["wifi"].log
+        if not text:
+            return
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        w.insert("end", text)
+        w.configure(state="disabled")
+        w.see("end")
+
+    def apply_last(self):
+        st = getattr(self, "last_state", None)
+        if st:
+            try:
+                self.pages[self.current].apply(st)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    def tick(self):
+        self.refresh()
+        self.hotspot_tick()
+        self.root.after(3000, self.tick)
+
+    # ---------- aksi
+    def wd(self, what):
+        if what == "enable":
+            cmd, msg = "systemctl enable --now wifi-watchdog.timer", "Watchdog diaktifkan"
+        elif what == "disable":
+            cmd, msg = "systemctl disable --now wifi-watchdog.timer", "Watchdog dimatikan"
+        else:
+            cmd, msg = "systemctl start wifi-watchdog.service", "Watchdog dijalankan sekali"
+        self.say("menunggu izin…")
+        self.bg(lambda: pkexec(cmd, timeout=60),
+                lambda r: self.say("%s — %s" % (msg, "ok" if r[1] == 0 else r[0][:120]),
+                                   GREEN if r[1] == 0 else RED))
+
+    def ps(self, value):
+        conf = "[connection]\nwifi.powersave = %s\n" % value
+        try:
+            with open(TMPCONF, "w", encoding="utf-8") as fh:
+                fh.write(conf)
+            os.chmod(TMPCONF, 0o600)
+        except OSError as exc:
+            self.say("gagal menulis setelan: %s" % exc, RED)
+            return
+        conns = [n for n, _ in conn_powersave()]
+        mod = "; ".join("nmcli con modify '%s' 802-11-wireless.powersave %s" %
+                        (n.replace("'", "'\\''"), value) for n in conns)
+        cmd = ("install -m 0644 %s %s && systemctl reload NetworkManager"
+               % (TMPCONF, ZCONF)) + (("; " + mod) if mod else "")
+        self.say("menerapkan powersave…")
+        self.bg(lambda: pkexec(cmd, timeout=90),
+                lambda r: self.say("Powersave %s — %s" %
+                                   ("nonaktif" if value == "2" else "aktif",
+                                    "ok" if r[1] == 0 else r[0][:140]),
+                                   GREEN if r[1] == 0 else RED))
+
+    def reset(self):
+        if os.path.exists(WIFI_RESET):
+            if not self.ask("Reset WiFi sekarang?\n\nDriver in-kernel dilepas, "
+                            "PCI di-reset, lalu driver dimuat lagi. Koneksi "
+                            "putus sekitar 20 detik."):
+                return
+            self.say("mereset WiFi… (minta izin)")
+            self.bg(lambda: sh([WIFI_RESET], timeout=180),
+                    lambda r: self.say("Reset selesai — %s" %
+                                       ("ok" if r[1] == 0 else r[0][-140:]),
+                                       GREEN if r[1] == 0 else RED))
+            return
+        if shutil.which("nmcli"):
+            if not self.ask("wifi-reset khusus Ubuntu tidak ada.\n\n"
+                            "Gunakan reset NetworkManager (Wi-Fi putus sebentar)?"):
+                return
+            self.say("mereset NetworkManager… (minta izin)")
+            self.bg(lambda: pkexec("nmcli networking off; sleep 2; "
+                                    "nmcli networking on", timeout=90),
+                    lambda r: self.say("Reset NetworkManager — %s" %
+                                       ("ok" if r[1] == 0 else r[0][-140:]),
+                                       GREEN if r[1] == 0 else RED))
+            return
+        self.say("Reset tidak tersedia: wifi-reset/nmcli tidak ditemukan", RED)
+
+    def check(self):
+        self.say("memeriksa…")
+        if os.path.exists(WIFI_RESET):
+            self.bg(lambda: sh([WIFI_RESET, "--check"], timeout=30),
+                    lambda r: self.info("Cek cepat\n\n" + r[0]))
+            return
+        self.bg(lambda: sh(["nmcli", "device", "status"], timeout=20)
+                if shutil.which("nmcli") else sh(["ip", "-brief", "link"]),
+                lambda r: self.info("Cek cepat\n\n" + r[0]))
+
+    def scan(self):
+        self.bg(lambda: sh(["nmcli", "device", "wifi", "rescan"], timeout=30),
+                lambda r: self.say("scan ulang dikirim" if r[1] == 0 else r[0][:120],
+                                   GREEN if r[1] == 0 else RED))
+
+    def radio(self):
+        cur, _ = sh(["nmcli", "-t", "-f", "WIFI", "general", "status"])
+        target = "off" if cur.strip() == "enabled" else "on"
+        self.bg(lambda: sh(["nmcli", "radio", "wifi", target], timeout=30),
+                lambda r: self.say("radio wifi %s %s" % (target, "ok" if r[1] == 0 else r[0][:100]),
+                                   GREEN if r[1] == 0 else RED))
+
+    # ---------- hotspot
+    def hotspot_page(self):
+        return self.pages.get("hotspot")
+
+    def hotspot_update(self):
+        page = self.hotspot_page()
+        if page is not None:
+            try:
+                page.refresh_sources()
+                page.render_state()
+            except Exception:
+                traceback.print_exc()
+
+    def hotspot_toggle(self):
+        if self.hs_busy:
+            return
+        if self.hs_state.get("running"):
+            self.hs_busy = True
+            self.hs_message = "Mematikan hotspot..."
+            self.hotspot_update()
+            try:
+                self.hs_client.send(cmd="stop")
+            except Exception as exc:
+                self.hs_busy = False
+                self.hs_message = str(exc)
+                self.hotspot_update()
+            return
+        page = self.hotspot_page()
+        if page is None:
+            return
+        cfg = page.get_config()
+        if cfg is None:
+            return
+        if not os.path.exists(HOTSPOT_HELPER):
+            self.info("Helper hotspot belum dipasang.\n\n"
+                      "Jalankan dari folder tool:\n"
+                      "sudo ./install-hotspot.sh")
+            return
+        self.hs_busy = True
+        self.hs_message = "Menunggu izin administrator..."
+        self.say("menyalakan hotspot...")
+        self.hotspot_update()
+        try:
+            self.hs_client.start()
+            self.hs_client.send(cmd="start", **cfg)
+        except Exception as exc:
+            self.hs_busy = False
+            self.hs_message = str(exc)
+            self.say(str(exc)[:120], RED)
+            self.hotspot_update()
+
+    def hotspot_tick(self):
+        self.hotspot_drain()
+        if not self.hs_client.alive:
+            return
+        if self.current != "hotspot":
+            return
+        if time.monotonic() - self.hs_last_poll < 3:
+            return
+        self.hs_last_poll = time.monotonic()
+        try:
+            self.hs_client.send(cmd="status")
+            if self.hs_state.get("running"):
+                self.hs_client.send(cmd="clients")
+        except Exception:
+            pass
+
+    def hotspot_drain(self):
+        while True:
+            try:
+                msg = self.hs_client.q.get_nowait()
+            except queue.Empty:
+                break
+            if msg.get("event") == "exit":
+                self.hs_busy = False
+                self.hs_state = {"running": False}
+                self.hs_message = "Helper hotspot berhenti."
+                self.hotspot_update()
+                continue
+            if not msg.get("ok", True):
+                self.hs_busy = False
+                self.hs_message = msg.get("error", "Gagal menjalankan hotspot.")
+                self.say(self.hs_message[:120], RED)
+                self.hotspot_update()
+                continue
+            if msg.get("ready"):
+                continue
+            if "clients" in msg:
+                page = self.hotspot_page()
+                if page is not None:
+                    page.render_clients(msg.get("clients", []))
+                continue
+            if "blacklist" in msg and "running" not in msg:
+                self.hs_cfg["blacklist"] = list(msg.get("blacklist", []))
+                save_hotspot_cfg(self.hs_cfg)
+                page = self.hotspot_page()
+                if page is not None:
+                    page.render_blacklist()
+                continue
+            if "running" in msg:
+                self.hs_state = msg
+                self.hs_busy = False
+                if msg.get("running"):
+                    self.hs_message = "Hotspot aktif."
+                    self.say("hotspot aktif di %s (%s)" %
+                             (msg.get("channel"), msg.get("upstream")), GREEN)
+                    try:
+                        self.hs_client.send(cmd="clients")
+                    except Exception:
+                        pass
+                else:
+                    self.hs_message = "Hotspot dihentikan."
+                    self.say("hotspot dihentikan")
+                self.hotspot_update()
+
+    def hotspot_refresh(self):
+        if not self.hs_client.alive:
+            return
+        try:
+            self.hs_client.send(cmd="status")
+            if self.hs_state.get("running"):
+                self.hs_client.send(cmd="clients")
+        except Exception:
+            pass
+
+    def hotspot_kick(self):
+        page = self.hotspot_page()
+        mac = page.selected_mac() if page else None
+        if not mac:
+            self.info("Pilih client terlebih dahulu.")
+            return
+        if not self.ask("Putuskan client %s?" % mac):
+            return
+        try:
+            self.hs_client.send(cmd="kick", mac=mac)
+            self.say("client diputuskan", GREEN)
+        except Exception as exc:
+            self.info(str(exc))
+
+    def hotspot_blacklist_selected(self):
+        page = self.hotspot_page()
+        mac = page.selected_mac() if page else None
+        if not mac:
+            self.info("Pilih client terlebih dahulu.")
+            return
+        if mac not in self.hs_cfg.get("blacklist", []):
+            self.hs_cfg.setdefault("blacklist", []).append(mac)
+            save_hotspot_cfg(self.hs_cfg)
+        page.render_blacklist()
+        if self.hs_client.alive:
+            try:
+                self.hs_client.send(cmd="blacklist", mac=mac, add=True)
+                self.say("blacklist diperbarui", GREEN)
+            except Exception as exc:
+                self.info(str(exc))
+
+    def hotspot_add_blacklist(self):
+        page = self.hotspot_page()
+        if page is None:
+            return
+        mac = page.bl_var.get().strip().lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+            self.info("Alamat MAC tidak valid.")
+            return
+        if mac not in self.hs_cfg.get("blacklist", []):
+            self.hs_cfg.setdefault("blacklist", []).append(mac)
+            save_hotspot_cfg(self.hs_cfg)
+        page.bl_var.set("")
+        page.render_blacklist()
+        if self.hs_client.alive:
+            try:
+                self.hs_client.send(cmd="blacklist", mac=mac, add=True)
+            except Exception:
+                pass
+
+    def hotspot_remove_blacklist(self):
+        page = self.hotspot_page()
+        if page is None:
+            return
+        sel = page.bl_list.curselection()
+        if not sel:
+            return
+        mac = page.bl_list.get(sel[0]).lower()
+        if mac not in self.hs_cfg.get("blacklist", []):
+            return
+        self.hs_cfg["blacklist"].remove(mac)
+        save_hotspot_cfg(self.hs_cfg)
+        page.render_blacklist()
+        if self.hs_client.alive:
+            try:
+                self.hs_client.send(cmd="blacklist", mac=mac, add=False)
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            self.hs_client.close()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ---------- scan / konek / portal
+    def scan_networks(self):
+        page = self.pages["wifi"]
+        page.scan_lbl.configure(text="memindai…", fg=MUT)
+        self.say("memindai jaringan…")
+        def work():
+            if not wifi_iface():
+                return []
+            sh(["nmcli", "device", "wifi", "rescan"], timeout=25)
+            time.sleep(2)
+            out, _ = sh(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY,IN-USE",
+                         "device", "wifi", "list"], timeout=25)
+            nets = []
+            for line in out.splitlines():
+                p = split_nmcli(line)
+                if len(p) < 4:
+                    continue
+                ssid, sig, sec, use = p[0], p[1], p[2], ":".join(p[3:])
+                if not ssid.strip():
+                    continue
+                nets.append({"ssid": ssid, "signal": sig, "sec": sec,
+                             "inuse": use.strip() == "*"})
+            nets.sort(key=lambda n: (not n["inuse"], -int(n["signal"] or 0)))
+            unique = {}
+            for n in nets:
+                key = n["ssid"]
+                cur = unique.get(key)
+                if cur is None or (n["inuse"], int(n["signal"] or 0)) > (
+                        cur["inuse"], int(cur["signal"] or 0)):
+                    unique[key] = n
+            nets = sorted(unique.values(),
+                          key=lambda n: (not n["inuse"], -int(n["signal"] or 0)))
+            return nets
+        self.bg(work, self.set_networks)
+
+    def set_networks(self, nets):
+        page = self.pages["wifi"]
+        page.networks = nets
+        page.scan_list.delete(0, "end")
+        for n in nets:
+            mark = "●" if n["inuse"] else " "
+            sec = "terbuka" if n["sec"] in ("", "--") else n["sec"]
+            page.scan_list.insert(
+                "end", "%s %-25s %3s%%  %s" % (mark, n["ssid"][:25], n["signal"], sec))
+        page.scan_lbl.configure(text="%d jaringan ditemukan" % len(nets))
+        if not nets:
+            page.scan_lbl.configure(
+                text="0 jaringan — kartu mungkin wedge; coba Reset WiFi", fg=RED)
+        else:
+            page.scan_lbl.configure(fg=DIM)
+        self.say("scan selesai: %d jaringan" % len(nets), GREEN)
+
+    def connect_selected(self):
+        page = self.pages["wifi"]
+        sel = page.scan_list.curselection()
+        if not sel:
+            self.say("pilih jaringan dulu (klik dua kali untuk langsung konek)", ORANGE)
+            return
+        net = page.networks[sel[0]]
+        ssid = net["ssid"]
+        pwd = ""
+        if net["sec"] not in ("", "--"):
+            pwd = self.ask_password(ssid)
+            if pwd is None:
+                return
+        self.say("menghubungkan ke %s…" % ssid)
+
+        def work():
+            args = ["nmcli", "--ask", "device", "wifi", "connect", ssid]
+            data = (pwd + "\n") if pwd else ""
+            out, rc = sh_input(args, data, timeout=90)
+            if rc != 0 and re.search(r"not authorized|insufficient privilege|polkit",
+                                     out, re.I):
+                out, rc = sh_input(["pkexec"] + args, data, timeout=150)
+            return out, rc
+
+        self.bg(work, lambda r: self.after_connect(ssid, r))
+
+    def after_connect(self, ssid, res):
+        out, rc = res
+        if rc == 0:
+            self.say("terhubung ke %s" % ssid, GREEN)
+        else:
+            tail = [ln for ln in out.splitlines() if ln.strip()]
+            self.say("gagal: %s" % (tail[-1][:130] if tail else "tidak diketahui"), RED)
+        self.refresh()
+        self.root.after(1200, self.check_portal)
+
+    def check_portal(self):
+        def work():
+            wifi = next((d for d in dev_list()
+                         if d["type"] == "wifi" and d["state"].startswith("connected")), None)
+            iface = wifi["dev"] if wifi else ""
+            gw = ""
+            if iface:
+                route, _ = sh(["ip", "route", "show", "dev", iface])
+                m = re.search(r"default via (\S+)", route)
+                gw = m.group(1) if m else ""
+            if not gw:
+                route, _ = sh(["ip", "route", "show", "default"])
+                m = re.search(r"default via (\S+) dev (\S+)", route)
+                if m:
+                    gw, iface = m.group(1), m.group(2)
+            code, url = "", ""
+            if gw:
+                cmd = ["curl", "-sS", "-m", "8", "-o", "/dev/null",
+                       "-w", "%{http_code} %{redirect_url}"]
+                if iface:
+                    cmd += ["--interface", iface]
+                cmd.append("http://connectivitycheck.gstatic.com/generate_204")
+                probe, _ = sh(cmd, timeout=14)
+                parts = probe.split(" ", 1)
+                code = parts[0].strip()
+                if len(parts) > 1:
+                    url = parts[1].strip()
+            return iface, gw, code, url
+        self.bg(work, self.set_portal)
+
+    def set_portal(self, res):
+        iface, gw, code, url = res
+        page = self.pages.get("wifi")
+        if not page:
+            return
+        self.portal_url = url or ("http://%s/" % gw if gw else "")
+        where = ("%s via %s" % (iface, gw)) if iface else "tanpa koneksi"
+        cur_conn = ""
+        st = getattr(self, "last_state", None)
+        if st:
+            wd = next((d for d in st["devices"] if d["type"] == "wifi"), None)
+            if wd:
+                cur_conn = wd.get("conn", "")
+        if page.url_entry.get().strip() == "":
+            fill = self.load_portal_url(cur_conn) if cur_conn else ""
+            if not fill:
+                fill = url or (("http://%s/" % gw) if gw else "")
+            if fill:
+                page.url_entry.insert(0, fill)
+        if not gw:
+            page.portal_lbl.configure(text="Portal: belum ada koneksi", fg=MUT)
+        elif code == "204":
+            page.portal_lbl.configure(
+                text="%s · internet normal (tanpa portal)" % where, fg=GREEN)
+        elif code in ("301", "302", "303", "307", "308") and url:
+            page.portal_lbl.configure(
+                text="%s · butuh login web: %s" % (where, url), fg=ORANGE)
+        elif not code:
+            page.portal_lbl.configure(
+                text="%s · cek portal gagal (tidak ada balasan); "
+                     "coba tombol Buka halaman login" % where, fg=ORANGE)
+        else:
+            page.portal_lbl.configure(
+                text="%s · balasan HTTP %s (kemungkinan portal); "
+                     "coba tombol Buka halaman login" % (where, code), fg=ORANGE)
+
+    def open_portal(self):
+        page = self.pages.get("wifi")
+        url = ""
+        if page:
+            url = page.url_entry.get().strip()
+        if not url:
+            url = getattr(self, "portal_url", "") or ""
+        if not url:
+            st = getattr(self, "last_state", None)
+            gw = st.get("default_gw", "") if st else ""
+            if gw and gw != "—":
+                url = "http://%s/" % gw
+        if not url:
+            self.say("belum ada gateway (belum terhubung)", ORANGE)
+            return
+        if not url.startswith("http"):
+            url = "http://" + url
+        self.save_portal_url(url)
+        self.bg(lambda: sh(["xdg-open", url], timeout=20),
+                lambda r: self.say("membuka %s" % url, GREEN if r[1] == 0 else RED))
+
+    def portals_path(self):
+        return os.path.join(HOME, ".config", "diknom-network", "portal.json")
+
+    def load_portal_url(self, ssid):
+        try:
+            with open(self.portals_path(), encoding="utf-8") as fh:
+                return json.load(fh).get(ssid, "")
+        except (OSError, ValueError):
+            return ""
+
+    def save_portal_url(self, url):
+        page = self.pages.get("wifi")
+        ssid = ""
+        if page and page.networks:
+            st = getattr(self, "last_state", None)
+            if st:
+                wifi = next((d for d in st["devices"] if d["type"] == "wifi"), None)
+                if wifi and wifi.get("conn"):
+                    ssid = wifi["conn"]
+        if not ssid:
+            return
+        path = self.portals_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                data = {}
+            data[ssid] = url
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, sort_keys=True)
+        except OSError:
+            pass
+
+    def ask_password(self, ssid):
+        top = tk.Toplevel(self.root)
+        top.title("Kata sandi WiFi")
+        top.configure(bg=CARD)
+        top.transient(self.root)
+        top.resizable(False, False)
+        tk.Label(top, text="Kata sandi untuk " + ssid, bg=CARD, fg=FG,
+                 font=(FONT, 11, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(top, text="Dikirim ke NetworkManager; tidak disimpan oleh panel ini.",
+                 bg=CARD, fg=MUT, font=(FONT, 8)).pack(anchor="w", padx=16, pady=(0, 8))
+        entry = tk.Entry(top, show="•", bg="#0b0f14", fg=FG, insertbackground=FG,
+                         relief="flat", font=(MONO, 10), width=34)
+        entry.pack(padx=16, pady=(0, 12), ipady=5)
+        entry.focus_set()
+        result = {"v": None}
+
+        def ok():
+            result["v"] = entry.get()
+            top.destroy()
+
+        row = tk.Frame(top, bg=CARD)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+        self.button(row, "Batal", top.destroy).pack(side="right", padx=(6, 0))
+        self.button(row, "Hubungkan", ok).pack(side="right")
+        entry.bind("<Return>", lambda e: ok())
+        top.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - top.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - top.winfo_height()) // 2
+        top.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        top.grab_set()
+        top.wait_window()
+        return result["v"]
+
+    # ---------- dialog
+    def dialog(self, title, text, buttons):
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=CARD)
+        top.transient(self.root)
+        top.resizable(False, False)
+        tk.Label(top, text=title, bg=CARD, fg=FG, font=(FONT, 11, "bold")).pack(
+            anchor="w", padx=16, pady=(14, 4))
+        tk.Label(top, text=text, bg=CARD, fg=MUT, font=(FONT, BODY),
+                 justify="left", wraplength=460).pack(anchor="w", padx=16, pady=(0, 12))
+        row = tk.Frame(top, bg=CARD)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+        result = {"v": None}
+
+        def close(v):
+            result["v"] = v
+            top.destroy()
+
+        for label, val in buttons:
+            self.button(row, label, lambda v=val: close(v)).pack(side="right", padx=(6, 0))
+        top.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - top.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - top.winfo_height()) // 2
+        top.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        top.grab_set()
+        top.wait_window()
+        return result["v"]
+
+    def ask(self, text):
+        return self.dialog("Konfirmasi", text,
+                           [("Ya", True), ("Batal", False)]) is True
+
+    def info(self, text):
+        self.dialog("Informasi", text, [("Tutup", True)])
+
+
+def acquire_single_instance():
+    """Cegah dua jendela. Kalau sudah jalan, naikkan jendela yang ada."""
+    import fcntl
+    path = os.path.join(HOME, ".cache", "diknom-network.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        for cmd in (["xdotool", "search", "--name", "^DikNom System Network$",
+                     "windowactivate"],
+                    ["wmctrl", "-a", APP]):
+            try:
+                subprocess.run(cmd, timeout=5)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def main():
+    global FONT, MONO
+    lock = acquire_single_instance()
+    if lock is None:
+        return
+    root = tk.Tk()
+    try:
+        fams = set(tkfont.families(root))
+        FONT = "Noto Sans" if "Noto Sans" in fams else "DejaVu Sans"
+        MONO = "Noto Sans Mono" if "Noto Sans Mono" in fams else "DejaVu Sans Mono"
+    except Exception:  # noqa: BLE001
+        pass
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", app.close)
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(500, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

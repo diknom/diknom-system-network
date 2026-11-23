@@ -1,0 +1,775 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""DikNom System Network — helper hotspot.
+
+Dijalankan sebagai root lewat pkexec oleh DikNom System Network.
+Menerima perintah JSON satu baris di stdin dan membalas JSON di stdout.
+Tidak memakai shell; semua argumen divalidasi.
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUN = Path("/run/diknom-hotspot")
+AP_IF = "ap0"
+AP_IP = "10.42.0.1"
+AP_PREFIX = "10.42.0."
+ALLOW_WIFI_UPLINK = False  # sementara: hanya LAN/USB yang boleh jadi uplink
+HOSTAPD = shutil.which("hostapd") or "/usr/sbin/hostapd"
+HOSTAPD_CLI = shutil.which("hostapd_cli") or "/usr/sbin/hostapd_cli"
+DNSMASQ = shutil.which("dnsmasq") or "/usr/sbin/dnsmasq"
+IW = shutil.which("iw") or "/usr/sbin/iw"
+TC = shutil.which("tc") or "/usr/sbin/tc"
+IPTABLES = shutil.which("iptables") or "/usr/sbin/iptables"
+NMCLI = shutil.which("nmcli")
+
+STATE = {
+    "running": False,
+    "ssid": "",
+    "security": "wpa2",
+    "max_clients": 8,
+    "upstream": None,
+    "ap_if": AP_IF,
+    "channel": None,
+    "started": 0,
+    "hostapd_pid": None,
+    "dnsmasq_pid": None,
+    "ip_forward_prev": None,
+    "blacklist": [],
+    "error": "",
+    "restore_wifi": False,
+    "upstream_conn": None,
+    "nat_ifaces": [],
+}
+LOCK = None
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run(args, timeout=8, check=False, data=None):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True,
+                           timeout=timeout, input=data)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{args[0]} tidak ditemukan: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{args[0]} timeout") from exc
+    if check and p.returncode != 0:
+        msg = (p.stderr or p.stdout or "").strip()
+        raise RuntimeError(f"{args[0]} gagal: {msg[:300]}")
+    return p
+
+
+def read(path, default=""):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return default
+
+
+def write(path, text, mode=0o600):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(p, mode)
+    except OSError:
+        pass
+
+
+def valid_mac(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().lower()
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", value):
+        raise ValueError("Alamat MAC tidak valid")
+    return value
+
+
+def valid_iface(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", value):
+        raise ValueError("Nama interface tidak valid")
+    if not os.path.exists(f"/sys/class/net/{value}"):
+        raise ValueError(f"Interface {value} tidak ditemukan")
+    return value
+
+
+def valid_ssid(value):
+    if not isinstance(value, str):
+        raise ValueError("SSID tidak valid")
+    if not value or len(value.encode("utf-8")) > 32:
+        raise ValueError("SSID harus 1-32 byte")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("SSID mengandung karakter kontrol")
+    return value
+
+
+def valid_password(value):
+    if not isinstance(value, str):
+        raise ValueError("Password tidak valid")
+    if not 8 <= len(value) <= 63:
+        raise ValueError("Password harus 8-63 karakter")
+    if any(ch in value for ch in "\r\n\x00"):
+        raise ValueError("Password mengandung karakter terlarang")
+    return value
+
+
+def is_wifi(iface):
+    return os.path.exists(f"/sys/class/net/{iface}/wireless")
+
+
+def wifi_interfaces():
+    result = []
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return result
+    for name in names:
+        if is_wifi(name):
+            try:
+                info = run([IW, "dev", name, "info"], timeout=2).stdout
+            except Exception:
+                info = ""
+            if "type managed" in info:
+                result.append(name)
+    return result
+
+
+def default_upstream():
+    try:
+        text = run(["ip", "route", "show", "default"], timeout=3).stdout
+    except Exception:
+        return None
+    candidates = []
+    for line in text.splitlines():
+        m = re.search(r"\bdev\s+(\S+)", line)
+        if m:
+            candidates.append(m.group(1))
+    for cand in candidates:
+        if not cand.startswith("tailscale"):
+            return cand
+    return candidates[0] if candidates else None
+
+
+def phy_of(iface):
+    text = run([IW, "dev", iface, "info"], timeout=3).stdout
+    m = re.search(r"wiphy\s+(\d+)", text)
+    if not m:
+        raise RuntimeError("Tidak bisa menemukan phy Wi-Fi")
+    return f"phy{m.group(1)}"
+
+
+def channel_of(iface):
+    text = run([IW, "dev", iface, "info"], timeout=3).stdout
+    m = re.search(r"channel\s+(\d+)\s+\((\d+)\s+MHz\)", text)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def country_code():
+    try:
+        text = run([IW, "reg", "get"], timeout=3).stdout
+        m = re.search(r"country\s+([A-Z]{2})", text)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "ID"
+
+
+def mac_of(iface):
+    text = read(f"/sys/class/net/{iface}/address").strip()
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", text):
+        raise RuntimeError("MAC interface tidak terbaca")
+    return text.lower()
+
+
+def ap_mac_for(iface):
+    mac = mac_of(iface)
+    return "02:" + mac.split(":", 1)[1]
+
+
+def dns_servers(upstream=None):
+    result = []
+    if upstream and NMCLI:
+        try:
+            text = run([NMCLI, "-t", "-g", "IP4.DNS", "device", "show",
+                        upstream], timeout=3).stdout
+            for line in text.splitlines():
+                ns = line.strip()
+                if ns and not ns.startswith("127.") and ns not in ("::1", "0.0.0.0"):
+                    if ns not in result:
+                        result.append(ns)
+        except Exception:
+            pass
+    for line in read("/etc/resolv.conf").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "nameserver":
+            ns = parts[1]
+            if ns.startswith("127.") or ns in ("::1", "0.0.0.0"):
+                continue
+            if ns not in result:
+                result.append(ns)
+    return result[:2] or ["1.1.1.1", "8.8.8.8"]
+
+
+def hostapd_config(ssid, password, security, max_clients, channel, country,
+                   width=20):
+    lines = [
+        f"interface={AP_IF}",
+        "driver=nl80211",
+        f"ssid={ssid}",
+        f"hw_mode={'g' if channel <= 14 else 'a'}",
+        f"channel={channel}",
+        f"country_code={country}",
+        "ieee80211d=1",
+        "ieee80211n=1",
+        *(["ht_capab=[HT40+]"] if width >= 40 and channel <= 14 else []),
+        "wmm_enabled=1",
+        "auth_algs=1",
+        "ignore_broadcast_ssid=0",
+        "beacon_int=100",
+        "dtim_period=2",
+        "ap_isolate=0",
+        f"max_num_sta={max_clients}",
+        f"ctrl_interface={RUN}/hostapd",
+        "ctrl_interface_group=0",
+    ]
+    if channel > 14:
+        lines += ["ieee80211ac=1", "vht_oper_chwidth=0"]
+    if security == "wpa2":
+        lines += [
+            "wpa=2", "wpa_key_mgmt=WPA-PSK",
+            "wpa_pairwise=CCMP", "rsn_pairwise=CCMP",
+            f"wpa_passphrase={password}",
+        ]
+    elif security == "wpa3":
+        lines += [
+            "wpa=2", "wpa_key_mgmt=SAE", "ieee80211w=2",
+            "rsn_pairwise=CCMP", f"sae_password={password}",
+        ]
+    elif security == "wpa2wpa3":
+        lines += [
+            "wpa=2", "wpa_key_mgmt=WPA-PSK SAE", "ieee80211w=1",
+            "wpa_pairwise=CCMP", "rsn_pairwise=CCMP",
+            f"wpa_passphrase={password}", f"sae_password={password}",
+        ]
+    blacklist_file = RUN / "deny_mac.txt"
+    if blacklist_file.exists():
+        lines.append(f"deny_mac_file={blacklist_file}")
+    return "\n".join(lines) + "\n"
+
+
+def dnsmasq_config(max_clients, upstream=None):
+    dns = dns_servers(upstream)
+    end = 10 + int(max_clients) - 1
+    if end > 250:
+        end = 250
+    return "\n".join([
+        f"interface={AP_IF}",
+        "bind-dynamic",
+        "port=0",
+        f"dhcp-range={AP_PREFIX}10,{AP_PREFIX}{end},255.255.255.0,12h",
+        f"dhcp-option=3,{AP_IP}",
+        "dhcp-option=6," + ",".join(dns),
+        "dhcp-authoritative",
+        f"dhcp-leasefile={RUN}/dnsmasq.leases",
+        "log-dhcp",
+        f"log-facility={RUN}/dnsmasq.log",
+    ]) + "\n"
+
+
+def write_deny(macs):
+    lines = sorted(set(macs))
+    text = "".join(mac + "\n" for mac in lines)
+    if not text:
+        text = "# blacklist kosong\n"
+    write(RUN / "deny_mac.txt", text)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_nm_unmanaged():
+    """Cegah NetworkManager mengubah ap0 menjadi managed saat dibuat."""
+    if not NMCLI:
+        return
+    conf = Path("/etc/NetworkManager/conf.d/99-diknom-hotspot.conf")
+    wanted = ("# Dibuat oleh DikNom System Network: "
+              "interface AP virtual jangan dikelola NM\n"
+              "[keyfile]\n"
+              "unmanaged-devices=interface-name:ap0\n")
+    try:
+        current = conf.read_text(encoding="utf-8") if conf.exists() else ""
+        if current != wanted:
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(wanted, encoding="utf-8")
+            run([NMCLI, "general", "reload", "conf"], timeout=10)
+    except Exception as exc:
+        log("nm unmanaged: " + str(exc))
+
+
+def stop_processes():
+    for key in ("hostapd_pid", "dnsmasq_pid"):
+        pid = STATE.get(key)
+        if pid and pid_alive(pid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+    time.sleep(0.5)
+    for key in ("hostapd_pid", "dnsmasq_pid"):
+        pid = STATE.get(key)
+        if pid and pid_alive(pid):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        STATE[key] = None
+
+
+def nft_delete():
+    try:
+        run(["nft", "delete", "table", "ip", "dsm_hotspot"], timeout=4)
+    except Exception:
+        pass
+
+
+def iptables_delete():
+    for iface in list(STATE.get("nat_ifaces", [])):
+        for args in (
+            ["-t", "nat", "-D", "POSTROUTING", "-s", "10.42.0.0/24",
+             "-o", iface, "-j", "MASQUERADE"],
+            ["-D", "FORWARD", "-i", AP_IF, "-o", iface, "-j", "ACCEPT"],
+            ["-D", "FORWARD", "-i", iface, "-o", AP_IF, "-m", "conntrack",
+             "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ):
+            try:
+                run([IPTABLES] + args, timeout=4)
+            except Exception:
+                pass
+    STATE["nat_ifaces"] = []
+
+
+def cleanup_network():
+    stop_processes()
+    nft_delete()
+    iptables_delete()
+    try:
+        run([TC, "qdisc", "del", "dev", AP_IF, "root"], timeout=3)
+    except Exception:
+        pass
+    try:
+        run(["ip", "addr", "flush", "dev", AP_IF], timeout=3)
+    except Exception:
+        pass
+    try:
+        run(["ip", "link", "set", AP_IF, "down"], timeout=3)
+    except Exception:
+        pass
+    try:
+        run([IW, "dev", AP_IF, "del"], timeout=3)
+    except Exception:
+        pass
+    prev = STATE.get("ip_forward_prev")
+    if prev is not None:
+        try:
+            Path("/proc/sys/net/ipv4/ip_forward").write_text(str(prev) + "\n")
+        except OSError:
+            pass
+        STATE["ip_forward_prev"] = None
+    # AP+STA pada sebagian driver membuat koneksi STA berhenti merutekan
+    # trafik setelah AP dimatikan. Aktifkan ulang profil Wi-Fi sumber.
+    if STATE.get("restore_wifi") and NMCLI and STATE.get("upstream_conn"):
+        try:
+            run([NMCLI, "connection", "up", str(STATE["upstream_conn"])],
+                timeout=12)
+        except Exception as exc:
+            log("restore wifi: " + str(exc))
+        STATE["restore_wifi"] = False
+    STATE["running"] = False
+    STATE["ap_if"] = AP_IF
+    STATE["channel"] = None
+    STATE["started"] = 0
+    for key in ("hostapd_pid", "dnsmasq_pid"):
+        STATE[key] = None
+
+
+def stop():
+    cleanup_network()
+    try:
+        shutil.rmtree(RUN)
+    except OSError:
+        pass
+    return status()
+
+
+def log_tail(name, n=8):
+    text = read(RUN / name)
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return " | ".join(lines[-n:])[:800]
+
+
+def start(cfg):
+    global STATE
+    if STATE.get("running"):
+        stop()
+    ssid = valid_ssid(cfg.get("ssid"))
+    security = cfg.get("security", "wpa2")
+    if security not in ("wpa2", "wpa3", "wpa2wpa3", "open"):
+        raise ValueError("Tipe keamanan tidak valid")
+    password = cfg.get("password", "")
+    if security != "open":
+        password = valid_password(password)
+    else:
+        password = ""
+    try:
+        max_clients = int(cfg.get("max_clients", 8))
+    except Exception:
+        raise ValueError("Maksimal client tidak valid")
+    if not 1 <= max_clients <= 64:
+        raise ValueError("Maksimal client harus 1-64")
+
+    upstream_req = cfg.get("upstream", "auto")
+    upstream = default_upstream() if upstream_req in ("auto", "", None) else valid_iface(upstream_req)
+    if upstream and not os.path.exists(f"/sys/class/net/{upstream}"):
+        upstream = None
+    wifi = upstream if upstream and is_wifi(upstream) else None
+    if not wifi:
+        candidates = wifi_interfaces()
+        wifi = candidates[0] if candidates else None
+    if not wifi:
+        raise RuntimeError("Tidak ada adapter Wi-Fi yang mendukung hotspot")
+    if not upstream:
+        raise RuntimeError("Tidak ada koneksi internet default (Ethernet/USB)")
+    if is_wifi(upstream) and not ALLOW_WIFI_UPLINK:
+        raise RuntimeError(
+            "Sementara hotspot hanya memakai LAN/USB sebagai sumber. "
+            "Uplink Wi-Fi dinonaktifkan agar koneksi host tetap stabil.")
+
+    channel, freq = channel_of(wifi)
+    sta_width = 20
+    try:
+        info = run([IW, "dev", wifi, "info"], timeout=3).stdout
+        wm = re.search(r"width:\s*(\d+)\s*MHz", info)
+        if wm:
+            sta_width = int(wm.group(1))
+    except Exception:
+        sta_width = 20
+    if upstream == wifi:
+        if not channel:
+            raise RuntimeError("Wi-Fi sumber belum tersambung ke jaringan")
+    else:
+        # Jika adapter Wi-Fi masih tersambung sebagai client, AP harus
+        # memakai channel yang sama (driver hanya mendukung satu channel).
+        if channel:
+            pass
+        else:
+            channel, freq = 6, 2437
+
+    upstream_conn = None
+    if upstream and is_wifi(upstream) and NMCLI:
+        try:
+            active = run([NMCLI, "-t", "-f", "NAME,DEVICE", "connection",
+                          "show", "--active"], timeout=4).stdout
+            for line in active.splitlines():
+                name, _, dev = line.partition(":")
+                if dev == upstream:
+                    upstream_conn = name
+                    break
+        except Exception:
+            upstream_conn = None
+
+    country = country_code()
+    phy = phy_of(wifi)
+    ap_mac = ap_mac_for(wifi)
+
+    RUN.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(RUN, 0o700)
+    except OSError:
+        pass
+
+    blacklist = [valid_mac(m) for m in cfg.get("blacklist", [])]
+    write_deny(blacklist)
+    write(RUN / "hostapd.conf",
+          hostapd_config(ssid, password, security, max_clients, channel, country,
+                         sta_width))
+    write(RUN / "dnsmasq.conf", dnsmasq_config(max_clients, upstream))
+
+    # Bersihkan sisa percobaan sebelumnya, lalu buat virtual AP.
+    cleanup_network()
+    ensure_nm_unmanaged()
+    run([IW, "dev", AP_IF, "del"], timeout=3)
+    run([IW, "phy", phy, "interface", "add", AP_IF, "type", "__ap",
+         "addr", ap_mac], timeout=5, check=True)
+    if NMCLI:
+        try:
+            run([NMCLI, "device", "set", AP_IF, "managed", "no"], timeout=3)
+        except Exception:
+            pass
+    run(["ip", "link", "set", AP_IF, "up"], timeout=3, check=True)
+    run(["ip", "addr", "add", f"{AP_IP}/24", "dev", AP_IF], timeout=3, check=True)
+
+    hostapd_log = RUN / "hostapd.log"
+    with open(hostapd_log, "w", encoding="utf-8") as fh:
+        p = subprocess.run(
+            [HOSTAPD, "-B", "-P", str(RUN / "hostapd.pid"),
+             str(RUN / "hostapd.conf")],
+            stdout=fh, stderr=subprocess.STDOUT, timeout=12)
+    if p.returncode != 0:
+        tail = log_tail("hostapd.log")
+        cleanup_network()
+        raise RuntimeError("hostapd gagal: " + (tail or f"kode {p.returncode}"))
+    time.sleep(1)
+    try:
+        hpid = int(read(RUN / "hostapd.pid").strip())
+    except Exception:
+        hpid = 0
+    if not hpid or not pid_alive(hpid):
+        tail = log_tail("hostapd.log")
+        cleanup_network()
+        raise RuntimeError("hostapd tidak berjalan: " + (tail or "tanpa log"))
+    STATE["hostapd_pid"] = hpid
+
+    # dnsmasq: DHCP saja, port 53 dimatikan agar tidak bentrok.
+    p = run([DNSMASQ, "--conf-file=" + str(RUN / "dnsmasq.conf"),
+             "--pid-file=" + str(RUN / "dnsmasq.pid")],
+            timeout=8)
+    if p.returncode != 0:
+        cleanup_network()
+        raise RuntimeError("dnsmasq gagal: " + (p.stderr or p.stdout or "").strip()[:300])
+    time.sleep(0.6)
+    try:
+        dpid = int(read(RUN / "dnsmasq.pid").strip())
+    except Exception:
+        dpid = 0
+    if not dpid or not pid_alive(dpid):
+        cleanup_network()
+        raise RuntimeError("dnsmasq tidak berjalan")
+    STATE["dnsmasq_pid"] = dpid
+
+    prev = read("/proc/sys/net/ipv4/ip_forward", "0").strip() or "0"
+    STATE["ip_forward_prev"] = prev
+    try:
+        Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
+    except OSError as exc:
+        cleanup_network()
+        raise RuntimeError("Tidak bisa mengaktifkan IP forwarding: " + str(exc))
+
+    nat_ifaces = [upstream]
+    fallback = default_upstream()
+    if (fallback and fallback != upstream and fallback not in
+            ("lo", AP_IF, "tailscale0")):
+        nat_ifaces.append(fallback)
+    try:
+        for iface in nat_ifaces:
+            run([IPTABLES, "-t", "nat", "-A", "POSTROUTING",
+                 "-s", "10.42.0.0/24", "-o", iface, "-j", "MASQUERADE"],
+                timeout=5, check=True)
+            run([IPTABLES, "-A", "FORWARD", "-i", AP_IF, "-o", iface,
+                 "-j", "ACCEPT"], timeout=5, check=True)
+            run([IPTABLES, "-A", "FORWARD", "-i", iface, "-o", AP_IF,
+                 "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+                 "-j", "ACCEPT"], timeout=5, check=True)
+        STATE["nat_ifaces"] = nat_ifaces
+    except Exception as exc:
+        cleanup_network()
+        raise RuntimeError("iptables gagal: " + str(exc))
+
+    STATE.update({
+        "running": True, "ssid": ssid, "security": security,
+        "max_clients": max_clients, "upstream": upstream,
+        "channel": channel, "started": time.time(),
+        "blacklist": blacklist, "error": "",
+        "restore_wifi": bool(upstream and is_wifi(upstream)),
+        "upstream_conn": upstream_conn,
+    })
+    return status()
+
+
+def status():
+    if STATE.get("running") and not pid_alive(STATE.get("hostapd_pid")):
+        STATE["running"] = False
+        STATE["error"] = "hostapd berhenti"
+    data = {k: v for k, v in STATE.items()
+            if k not in ("ip_forward_prev",)}
+    data["ok"] = True
+    data["helper"] = True
+    return data
+
+
+def parse_station_dump(text):
+    stations = {}
+    cur = None
+    for line in text.splitlines():
+        m = re.match(r"Station\s+([0-9a-fA-F:]{17})\s", line)
+        if m:
+            cur = m.group(1).lower()
+            stations[cur] = {"mac": cur, "signal": "-", "connected": 0,
+                             "rx": 0, "tx": 0}
+            continue
+        if not cur:
+            continue
+        s = line.strip()
+        if s.startswith("signal:"):
+            stations[cur]["signal"] = s.split(":", 1)[1].strip().split()[0] + " dBm"
+        elif s.startswith("connected time:"):
+            m2 = re.search(r"(\d+)", s)
+            if m2:
+                stations[cur]["connected"] = int(m2.group(1))
+        elif s.startswith("rx bytes:"):
+            m2 = re.search(r"(\d+)", s)
+            if m2:
+                stations[cur]["rx"] = int(m2.group(1))
+        elif s.startswith("tx bytes:"):
+            m2 = re.search(r"(\d+)", s)
+            if m2:
+                stations[cur]["tx"] = int(m2.group(1))
+    return stations
+
+
+def leases():
+    result = {}
+    for line in read(RUN / "dnsmasq.leases").splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            mac = parts[1].lower()
+            result[mac] = {"ip": parts[2], "hostname": parts[3]}
+    return result
+
+
+def clients():
+    if not STATE.get("running"):
+        return []
+    try:
+        text = run([IW, "dev", AP_IF, "station", "dump"], timeout=4).stdout
+    except Exception:
+        text = ""
+    stations = parse_station_dump(text)
+    lease = leases()
+    result = []
+    for mac, info in stations.items():
+        item = dict(info)
+        item.update(lease.get(mac, {"ip": "-", "hostname": "-"}))
+        item["blacklisted"] = mac in STATE.get("blacklist", [])
+        item["connected"] = int(item.get("connected", 0))
+        result.append(item)
+    result.sort(key=lambda x: x.get("connected", 0), reverse=True)
+    return result
+
+
+def kick(mac):
+    mac = valid_mac(mac)
+    if not STATE.get("running"):
+        raise RuntimeError("Hotspot tidak aktif")
+    ok = False
+    try:
+        p = run([HOSTAPD_CLI, "-p", str(RUN / "hostapd"), "-i", AP_IF,
+                 "deauthenticate", mac], timeout=4)
+        ok = p.returncode == 0 and "FAIL" not in (p.stdout or "").upper()
+    except Exception:
+        ok = False
+    if not ok:
+        run([IW, "dev", AP_IF, "station", "del", mac], timeout=4)
+    return {"ok": True, "mac": mac, "message": "Client diputuskan"}
+
+
+def blacklist(mac, add=True):
+    mac = valid_mac(mac)
+    current = list(STATE.get("blacklist", []))
+    if add and mac not in current:
+        current.append(mac)
+    if not add and mac in current:
+        current.remove(mac)
+    STATE["blacklist"] = current
+    write_deny(current)
+    if STATE.get("running") and STATE.get("hostapd_pid"):
+        try:
+            os.kill(int(STATE["hostapd_pid"]), signal.SIGHUP)
+        except OSError:
+            pass
+        if add:
+            try:
+                kick(mac)
+            except Exception:
+                pass
+    return {"ok": True, "blacklist": current,
+            "message": "Blacklist diperbarui"}
+
+
+def handle(cmd):
+    action = cmd.get("cmd")
+    if action == "ping":
+        return {"ok": True, "pong": True}
+    if action == "start":
+        return start(cmd)
+    if action == "stop":
+        return stop()
+    if action == "status":
+        return status()
+    if action == "clients":
+        return {"ok": True, "clients": clients()}
+    if action == "kick":
+        return kick(cmd.get("mac"))
+    if action == "blacklist":
+        return blacklist(cmd.get("mac"), bool(cmd.get("add", True)))
+    if action == "quit":
+        raise SystemExit(0)
+    raise ValueError("Perintah tidak dikenal")
+
+
+def main():
+    if os.geteuid() != 0:
+        out({"ok": False, "error": "Helper harus dijalankan sebagai root"})
+        return 1
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    out({"ok": True, "ready": True})
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cmd = json.loads(line)
+                if not isinstance(cmd, dict):
+                    raise ValueError("Perintah harus objek JSON")
+                out(handle(cmd))
+            except SystemExit:
+                raise
+            except Exception as exc:
+                log("hotspot error: " + str(exc))
+                out({"ok": False, "error": str(exc)})
+    finally:
+        try:
+            cleanup_network()
+            shutil.rmtree(RUN)
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
